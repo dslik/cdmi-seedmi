@@ -1,0 +1,83 @@
+# seedmi-dac: an example configuration. Paths are relative to this file.
+
+[listen]
+# Where requests arrive: the origin and path of the cdmi_dac_uri objects give.
+host = "127.0.0.1"
+port = 9443
+path = "/decide"
+certificate_file = "pki/https.crt"
+key_file = "pki/https.key"
+
+[provider]
+# The key requests are encrypted to, and its certificate: the one objects give,
+# as a JWK, in cdmi_dac_certificate (print it with --certificate-jwk).
+decryption_key_file = "pki/provider.key"
+certificate_file = "pki/provider.crt"
+# The key responses are signed with, and its certificate chain, which chains to
+# the certificate above. Kept apart from the decryption key, it can be replaced
+# without changing an object. Omitted, responses are signed with the key above.
+signing_key_file = "pki/signing.key"
+signing_chain_file = "pki/signing.crt"
+# A request identifier a server uses again within this window is a replay.
+replay_window_ms = 600000
+
+# Each CDMI server answered. A request is evaluated only where its signing key
+# is authenticated: by a certificate chain to a trust anchor (ca_file, and the
+# leaf's subject where subject is given), or as a key registered here
+# (key_file, the server's public signing key in PEM).
+[[server]]
+name = "cdmi-primary"
+ca_file = "pki/cdmi-ca.crt"
+subject = "CN=cdmi.example.com"
+# Where a response may be sent later (a rule with defer = true): each URI
+# exactly, or ending in "/", the URIs beneath it; and the anchors for that
+# endpoint's certificate, the system's where none is given.
+response_uris = ["https://cdmi.example.com/cdmi/3.0.0/cdmi_dac_response"]
+# response_ca_file = "pki/cdmi-ca.crt"
+
+# [[server]]
+# name = "cdmi-secondary"
+# key_file = "pki/cdmi-secondary.pub"
+
+# What the provider decides: rules in order, the first matching a request
+# deciding it, and a request no rule matches denied. An absent criterion matches
+# every request. The decision replaces the access control list's mask:
+#   grant  the rule's mask, whatever the list allowed
+#   narrow the list's mask and the rule's, together
+#   pass   the list's mask
+#   deny   no permission
+# A mask is names ("READ_OBJECT, READ_METADATA", "RW_ALL") or hexadecimal
+# ("0x0000008B"), combined by | or commas. Answers are given in hexadecimal.
+
+# A rule with defer = true is answered later: acknowledged at once with an empty
+# 202, the response sent by POST to the request's dac_response_uri, where the
+# server's response_uris permit it; otherwise answered at once.
+
+# A rule's operations are values of cdmi_operation, as revision 269 gives them:
+# cdmi_read, cdmi_read_metadata, cdmi_list, cdmi_create, cdmi_modify,
+# cdmi_modify_metadata and cdmi_delete.
+
+# Deletion is refused through the provider, whatever the list allows.
+[[rule]]
+operations = ["cdmi_delete"]
+decision = "deny"
+
+# Auditors, saying why they ask, may read, for five minutes before asking again.
+[[rule]]
+servers = ["cdmi-primary"]
+groups = ["auditors"]
+headers = { "CDMI-DAC-Purpose" = "audit" }
+decision = "grant"
+mask = "READ"
+response_headers = { "CDMI-DAC-Reason" = "audit access" }
+cache_seconds = 300
+
+# Everyone else may do what the list allows, but not change the metadata.
+[[rule]]
+decision = "narrow"
+mask = "0x001F07EF"
+
+[log]
+# The level beyond the arrival of a request, which is always recorded. The log
+# is JSON Lines and has no other form, so there is no format setting.
+level = "problems"

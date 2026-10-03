@@ -1,0 +1,78 @@
+# seedmi-zone: an example configuration. Paths are relative to this file.
+#
+# One instance per link, owning one zone subtree. Two writers on one subtree
+# undo each other's work — one deletes what the other has just seen — so a site
+# with several links runs one of these on each, each with a subtree of its own:
+#
+#   _cdmi._tcp.eng.example.com      on the engineering link
+#   _cdmi._tcp.lab.example.com      on the lab link
+#
+# A client then lists those as its browsing domains, which is what the
+# browse_domains member of cdmi_domain_doh is for.
+
+[link]
+# The interfaces the multicast group is joined on. Empty, or absent, is every
+# non-loopback interface that has an address.
+# interfaces = ["eth0"]
+ipv6 = true
+
+# The browsing domains browsed. "local" is the link, and is the case this
+# exists for.
+browse = ["local"]
+
+[zone]
+# The subtree written. Nothing outside it is ever touched, and a sweep that
+# produced a name elsewhere is a fault this program stops on rather than one it
+# lets a name server discover.
+name = "lan.example.com"
+
+# The lifetimes written into the zone. Short for the records naming a host,
+# because a host that moves or goes away should stop being believed quickly;
+# longer for the rest.
+ttl_host = 120
+ttl_other = 300
+
+# How often the link is swept. Each sweep asks the link and then makes one TLS
+# connection per instance, so more often than the lifetimes above buys nothing.
+sweep_interval_ms = 60000
+
+# Instance labels admitted, as patterns. Where none is given, every instance
+# that passes the gate is published — and the gate, not this list, is what
+# keeps an impostor out.
+# allow = ["^seedmi", "^files"]
+
+# The anchors for the certificates the gate verifies, where an internal
+# authority issued them. The gate connects to the address the link gave, with
+# the name about to be published as the server name, and publishes nothing
+# whose certificate does not verify for that name. Verification is never turned
+# off: it is the one thing standing between an announcement anybody on the link
+# could make and a name in a zone people trust.
+# ca_file = "pki/internal-ca.crt"
+
+# Where the records go. One of [update] and [unbound] is given.
+
+# RFC 2136 dynamic update, signed with TSIG. Works with BIND, Knot and
+# PowerDNS. The key is generated with tsig-keygen or keymgr and permitted to
+# update this subtree and no other.
+[update]
+host = "ns1.example.com"
+port = 53
+key_name = "seedmi-zone"
+key_algorithm = "hmac-sha256"
+key_secret_file = "tsig.key"
+
+# Or: records injected into a running Unbound, which is the tight fit where
+# Unbound is also the DNS-over-HTTPS server the browser talks to — the records
+# then live in the resolver that serves them, with no second daemon.
+#
+# [unbound]
+# command = "/usr/sbin/unbound-control"
+# args = ["-c", "/etc/unbound/unbound.conf"]
+
+[log]
+# What is recorded beyond starting, stopping and each write, which are always
+# written. "problems" adds an instance refused by the gate and a write that
+# failed; "sweeps" adds a line per sweep. The log is JSON Lines and has no
+# other form, so there is no format setting.
+level = "problems"
+# file = "zone.log"

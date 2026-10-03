@@ -1,0 +1,74 @@
+# seedmi-mdns: an example configuration. Paths are relative to this file.
+#
+# One responder runs per host. Port 5353 is held by one process, so a host
+# already running avahi-daemon has a responder: stop it, or advertise this
+# server through it instead —
+#
+#   avahi-publish -s "seedmi production" _cdmi._tcp 8443 txtvers=1 ver=CDMIv3.0
+#
+# This program advertises the CDMI servers on this host and publishes addresses
+# only for this host's own names. Discovering what other hosts advertise, and
+# carrying it into a real DNS zone, is seedmi-zone's job.
+
+[link]
+# The interfaces the multicast group is joined on. Empty, or absent, is every
+# non-loopback interface that has an address.
+# interfaces = ["eth0"]
+ipv6 = true
+
+# Each CDMI server advertised on this host. An instance identifies the host and
+# only the host: it carries no path and no base URI, because a host's
+# namespaces are discovered from its /.well-known/cdmi/cdmi_namespaces/ tree.
+[[instance]]
+# The DNS-SD instance label, which is "any user-friendly text" and may hold a
+# dot or a space. A second host claiming the same label is settled by probing:
+# the loser renames itself to "seedmi production (2)".
+name = "seedmi production"
+
+# The browsing domain the instance is published in. "local" is the link.
+domain = "local"
+
+# The host name a client connects to, and the port. The target need not be a
+# name in the browsing domain, and where a browser is the client it should not
+# be: a certificate cannot be issued for a .local name, so a browser that
+# discovers https://files.local:8443/ cannot mount it. Advertising a publicly
+# named host here — resolved to a LAN address by split horizon — keeps
+# discovery on the link while the connection is ordinary TLS.
+target = "files.example.com"
+port = 8443
+
+# The TXT record. txtvers is written for you; these two are optional.
+ver = ["CDMIv3.0"]
+display = "Production CDMI"
+
+# The addresses published for the target. Give these only where the target is
+# this host's own name: publishing addresses for another machine is proxying,
+# which a responder does not do.
+# addresses = ["192.0.2.10"]
+
+# Whether the instance is advertised at all is decided by polling the CDMI
+# server's well-known discovery tree — the thing a client reaches next anyway.
+# A server that stops answering is withdrawn with a goodbye rather than left on
+# the link for a browser to offer and a click to fail on. The URL defaults to
+# the target and port above; the certificate is verified, because the client
+# that follows the instance will verify the same one.
+check = true
+# check_url = "https://files.example.com:8443/.well-known/cdmi/cdmi_namespaces/"
+check_interval_ms = 30000
+# check_ca_file = "pki/internal-ca.crt"
+
+# A second CDMI server on the same host is a second instance, not a second
+# responder: there is one port 5353.
+#
+# [[instance]]
+# name = "seedmi staging"
+# target = "staging.example.com"
+# port = 9443
+
+[log]
+# What is recorded beyond starting, stopping and each instance coming and
+# going, which are always written. "problems" adds malformed messages, renames
+# and socket faults; "records" adds what is answered. The log is JSON Lines and
+# has no other form, so there is no format setting.
+level = "problems"
+# file = "mdns.log"

@@ -1,0 +1,366 @@
+# A seedmi configuration. Every setting has a default, so a file may give
+# as little as it likes; a command-line flag wins over anything here.
+#
+# This file holds the secrets of this server's own configuration:
+# certificates and their private keys, and the key access tokens are signed
+# with. No such material is
+# ever written into the "exports" field of an object: an export entry names a
+# certificate by an identifier, and the identifier is resolved here. The
+# credentials of the objects a domain holds are kept at a key management
+# server instead, named by a [[kms]] table below.
+
+store = "./data"
+base = "/cdmi/3.0.0/"
+
+# Serve the discovery tree at "/.well-known/cdmi/", by which a client
+# that knows only this origin finds a base URI and the capabilities of
+# this server. Set it only where this server controls the origin: the
+# path prefix is reserved at the origin and not at a path within it.
+well_known = true
+namespace_name = "production"
+
+[http]
+host = "127.0.0.1"
+port = 8080
+
+# The protocol binding over TLS, which needs a certificate: give one below
+# and uncomment both. The example starts without it, serving HTTP alone.
+# [https]
+# port = 8443
+# certificate = "binding"
+
+# What this deployment achieves for the service-level data system metadata items
+# of Annex D, for the part of it that no measurement reveals. The number of
+# copies, the number of infrastructures and the distance between them follow from
+# the architecture — one, one, and none — and the latency and the throughput are
+# measured against the store's directory when the server starts, so none of those
+# appears here. Each provided item below is reported only where it is configured.
+# [service_level]
+# Where objects are stored: ISO 3166-1 country codes or ISO 3166-2 subdivision
+# codes. A cdmi_geographic_placement item that permits none of these is refused
+# with the forbidden condition, as that item requires.
+# regions = ["CA-BC"]
+# The recovery objectives, in seconds, of whatever backup arrangement stands
+# behind this deployment. seedmi makes none of its own.
+# rpo = "3600"
+# rto = "7200"
+
+[export]
+# The origins a client may name in an export entry.
+origins = ["http://*.localhost:8080", "https://*.localhost:8443"]
+
+[[user]]
+name = "alice"
+password = "secret"
+groups = ["staff"]
+
+[[user]]
+name = "root"
+password = "toor"
+administrator = true
+# The privileges the draft defines are conferred by naming them:
+# cross_domain, import_service_credential, backup_operator, domain_kms_admin.
+# domain_kms_admin is what setting a domain's cdmi_domain_kms item needs.
+# privileges = ["domain_kms_admin"]
+
+# A certificate the protocol binding presents, or that an export at an https
+# origin presents for a host it covers: the first configured that covers the
+# origin's host is chosen, the binding's tried first. (An export entry cannot
+# name one: the draft requires its key be operated in place during the TLS
+# handshake, which this server cannot do.) Give the material inline, or name
+# a file beside this one with chain_file and key_file. None is given here,
+# since this file names only what it ships with; for one machine,
+#   openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj /CN=localhost \
+#     -keyout certs/localhost.key -out certs/localhost.crt
+# makes one for the binding.
+#
+# [[certificate]]
+# id = "binding"
+# chain_file = "certs/localhost.crt"
+# key_file = "certs/localhost.key"
+#
+# [[certificate]]
+# id = "files"
+# chain_file = "certs/files.localhost.crt"
+# key_file = "certs/files.localhost.key"
+
+# The credential a remote import in service identity mode presents where its
+# entry names none by credential_id: the name of a credential held at the key
+# management server the root domain names as its default, within the root
+# domain's scope. The secret itself is never held here. A principal needs the
+# import_service_credential privilege to configure an import that presents it.
+#
+# [imports]
+# service_credential = "svc-import"
+
+[oauth]
+# The tokens this server accepts from clients. Where server below is true, the
+# issuer and the key are that server's own and are not stated here: a key pair
+# is generated at startup and its public half published as a JWK Set, which is
+# what a client verifying by discovery needs. issuer, algorithm and
+# verify_key(_file) are for a token from an authorization server elsewhere.
+audience = "http://127.0.0.1:8080/cdmi/3.0.0/"
+
+# Where a token is exchanged for one a remote import source accepts,
+# as RFC 8693 defines. Where server is true, seedmi runs one of its own
+# so that a demonstration stands alone; a deployment gives
+# token_endpoint instead and leaves server unset. Where the token endpoint
+# authenticates this server, client_id names it and client_secret_id the name
+# of its credential, held at the root domain's default key management server;
+# the secret itself is never held here. token_endpoint_ca(_file) names the
+# authority for the token endpoint's certificate where the system does not
+# trust it, as for a domain controller's.
+#
+# Across realms, the token endpoint is that of the import source's realm's
+# domain controller, which trusts this server's realm ([[trust]] in seedmi-dc)
+# and exchanges the token its controller issued for one the source accepts; the
+# principal is named there with its realm, alice@EU.EXAMPLE.
+server = true
+server_port = 8090
+# Where a client reaches that server, which its metadata reports as the issuer,
+# the token endpoint and the JWK Set URI. Its scheme follows
+# server_certificate; without one it is http, which RFC 8414 does not permit
+# for an issuer, so a client that holds that requirement needs a certificate
+# here. Leave it unset and it is derived from the address the server listens on.
+server_base_uri = "http://127.0.0.1:8090"
+# server_certificate = "seedmi-cert"
+# The scopes it will issue. Space-delimited on the wire (RFC 6749); an entry
+# holding a comma or a space is refused.
+server_scopes = ["cdmi:read", "cdmi:write", "cdmi:admin"]
+# sign_key_file = "as.key"  # a PEM private key; a pair is generated without one
+client_id = "seedmi"
+
+# A client registered with that authorization server. An MCP client asking for
+# a "Resource AS Client ID" and secret wants these, and not a [[user]] name and
+# password. Without any [[oauth_client]] the server accepts any identifier and
+# any secret, which is a demonstration and not a deployment.
+[[oauth_client]]
+id = "mcp-inspector"
+secret = "change-this-to-something-long-and-secret"
+scopes = ["cdmi:read", "cdmi:write"]
+# The principal a token issued to this client names, where it uses the client
+# credentials grant and has no user in front of it. Without this the token names
+# the client, which no access control list grants anything to.
+user = "alice"
+
+[nfs]
+enabled = false
+port = 2049
+host = "127.0.0.1"
+# Whether an AUTH_SYS credential names a principal. Where this is false every NFS
+# request is evaluated as ANONYMOUS@, as the protocol binding does for a request
+# presenting no credential this server accepts.
+#
+# Where it is true and exactly one [[domain_controller]] is configured, the uid is
+# resolved there by uidNumber and the gids by gidNumber, so that an NFS identity and a
+# CDMI identity are one principal: an access control entry naming alice@EU.EXAMPLE
+# applies to the same alice arriving over NFS. A uid no principal has is anonymous, and
+# a directory that cannot be reached is the authentication-unavailable condition rather
+# than an anonymous request.
+#
+# Where it is true with no controller, the name is the number and the domain —
+# 100000@eu.example — which is not an identity any other protocol of this server knows.
+# Where it is true with several controllers, nothing is resolved: an NFS request carries
+# a uid and no domain, and a POSIX uid space is flat where CDMI domains are a tree, so a
+# uid does not say which directory should be asked.
+#
+# Note that AUTH_SYS is asserted by the client and authenticated by nothing. Turning
+# this on means trusting every host that can reach the port to say who it is.
+map_credentials = false
+
+# The SMB server, which serves the shares of SMB export entries. A
+# configured user authenticates with NTLMv2 and acts with its groups.
+# Without it, no SMB export capability is published and an SMB export
+# entry is refused. Port 445 needs privileges on most systems.
+[smb]
+enabled = false
+port = 445
+host = "127.0.0.1"
+
+# An access key an S3 client signs requests to an S3 export with, and
+# the configured user it acts as. The draft leaves how these are
+# established outside its scope, and no export entry carries them.
+[[s3_key]]
+access_key = "AKIAIOSFODNN7EXAMPLE"
+secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+user = "alice"
+
+# Key management servers, by the label a domain's cdmi_domain_kms names them.
+# Each is reached by KMIP 1.4 over TLS 1.2, seedmi authenticating with the
+# certificate given. seedmi holds no key management server within itself: the
+# one it is used with is seedmi-kms, a separate program run and configured on
+# its own (see its README).
+#
+# [[kms]]
+# label = "primary"
+# kind = "kmip"
+# host = "kms.example.com"
+# port = 5696
+# ca_file = "kms-ca.pem"
+# certificate_file = "seedmi-kmip.pem"
+# key_file = "seedmi-kmip.key"
+
+# The URIs this server may make a request of its own to: a remote copy or move,
+# a deserialization from another CDMI server, an import, and a delegated access
+# control request. Nothing is permitted until a [[permit]] table says so.
+# "addresses" states the addresses the authority may resolve to; an authority
+# that is an address literal needs none. A port of "*" permits any port.
+#
+# [[permit]]
+# uri = "https://other.example.com/cdmi/3.0.0/"
+# addresses = ["198.51.100.0/24"]
+#
+# [originated]
+# max_redirects = 0
+# max_response_bytes = 16777216
+# timeout_ms = 5000
+
+# Delegated access control: the decision for an object carrying the
+# cdmi_dac_uri and cdmi_dac_certificate metadata items is referred to the
+# provider those items name. The two keys of this server's identity are held at
+# the key management server the root domain names as default, and operated
+# there, never here: "signing_key_id" names the private key that signs a request,
+# and "encryption_key_id" the RSA private key a response is encrypted to, a
+# different key. Each is the name of the key within the root domain's scope.
+# "signing_chain_file" and "encryption_chain_file" give their certificates where
+# there are any. A [[kms]] table is needed. The provider's URI must also be
+# permitted by a [[permit]] table above.
+#
+# [dac]
+# signing_key_id = "dac-sign"
+# encryption_key_id = "dac-enc"
+# methods = ["https"]
+# ca_file = "dac-ca.pem"
+# response_window_ms = 60000
+# response_uri = "https://cdmi.example.com/cdmi/3.0.0/cdmi_dac_response"
+
+# Domain controllers: the principals of a domain, and of the domains beneath it
+# unless they name their own, resolved at a domain controller (seedmi-dc, or any
+# directory and authorization server speaking LDAP and OAuth alike). Basic
+# credentials are verified by an LDAP bind as the user, over TLS, which also
+# reads the user's groups; this server needs no account at the controller.
+# Bearer tokens are verified against the keys the issuer publishes, and must
+# name "audience" (this server). A principal so resolved is named with the
+# realm, alice@EU.EXAMPLE, as are its groups, and access control entries name
+# them so. A domain handed to a controller is administered by its principals
+# from then on, its domain object and those beneath it included, so make its
+# sub-domains and set its metadata first. A controller that cannot be reached
+# is reported as 503, the credentials not being at fault.
+#
+# [[domain_controller]]
+# domain = "/cdmi_domains/eu/"
+# realm = "EU.EXAMPLE"
+# ldap = "ldaps://dc-eu.example.com:636"
+# ca_file = "dc-eu-ca.pem"
+# # base = "dc=eu,dc=example"          # from the realm where not given
+# issuer = "https://dc-eu.example.com/"
+# audience = "https://cdmi.example.com/cdmi/3.0.0/"
+# # cache_seconds = 60
+# # timeout_ms = 5000
+#
+# The privileges the draft defines, conferred on a group within a domain: a
+# controller's group, named with its realm, or a group of this server's users.
+#
+# [[group_privileges]]
+# domain = "/cdmi_domains/eu/"
+# group = "storage-admins@EU.EXAMPLE"
+# privileges = ["cross_domain"]
+
+# Pipes: a WebSocket-to-TCP relay for browser clients, as an SSH client in the
+# browser needs one (RELAY-draft-2.md, NOTES-on-pipes.md). A pipe is a queue
+# object whose cdmi_queue_type is "seedmi_pipe"; its access control list says who
+# may use it (READ_OBJECT and WRITE_OBJECT), and [[pipe_permit]] tables say where
+# each principal may go. A connection names its host and port when it asks the
+# pipe for a ticket, and is made when a WebSocket on the pipe's URI, over the TLS
+# listener alone, presents the ticket. seedmi copies the bytes both ways and
+# neither terminates nor inspects them. With no [[pipe_permit]], no connection
+# can be made.
+#
+# [pipes]
+# enabled = true
+# allow_anonymous = false            # the default; a pipe's list cannot override it
+# ticket_ttl = 30                    # seconds, at most 300
+# connect_timeout = 10               # seconds
+# idle_timeout = 600                 # seconds without bytes in either direction
+# max_lifetime = 43200               # seconds
+# max_connections = 32               # per principal, tickets not yet used counted
+# max_connections_per_pipe = 64
+# max_connections_total = 256
+# max_frame = 1048576                # octets: the largest WebSocket frame or message read
+#
+# An allow-list: a destination is reached where a permit names its host and port,
+# every address its host resolves to is within the permit's ranges, and the
+# principal is one the permit admits. Hosts are names; a wildcard is the leftmost
+# label alone. Loopback, private and metadata addresses are reached only where a
+# permit lists them.
+#
+# [[pipe_permit]]
+# name = "dev shells"
+# hosts = ["shell.example.net", "*.dev.example.net"]
+# ports = [22]
+# addresses = ["192.0.2.0/24", "2001:db8:1::/48"]
+# principals = ["alice@EU.EXAMPLE"]  # optional: who may reach it
+# groups = ["staff@EU.EXAMPLE"]      # optional: or a member of one of these
+# domains = ["/cdmi_domains/eu/"]    # optional: through these domains' pipes alone
+
+# Homes: where the homes of a domain's principals are held, which this server
+# reports to each of them in the cdmi_domain_userinfo child of the domain object
+# (revision 282; HOMES-draft-3.md, NOTES-on-revision-282.md). The base URI may be
+# this server's own or another's; the path holds {identifier}, percent-encoded.
+#
+# [homes]
+# domain = "/cdmi_domains/eu/"
+# base = "https://homes.example.net/cdmi/3.0.0/"
+# path = "/home/{identifier}/"
+#
+# The homes this server holds, where it is the home server. The container
+# belongs to the domain whose homes it holds, so that a request beneath it is
+# resolved in that domain; a server holding the homes of several domains gives
+# each its own container. A home is made on its principal's first authenticated
+# request for it, owned by that principal and admitting it alone, unless
+# provision is false, when homes are pre-created by an administrator.
+#
+# [home_server]
+# container = "/home/"
+# domain = "/cdmi_domains/eu/"
+# provision = true
+
+# Where a domain's principals are resolved from this server's configuration
+# rather than from the cdmi_domain_auth item of the domain object, the same
+# fields the directory descriptor carries may be given here (revisions 298 and
+# 302): where the realm's key distribution centres are, the base URI beneath
+# which the homes of that domain are held, and the attribute each member of a
+# principal's description is taken from. Where no attribute is named for the
+# home, unixHomeDirectory is read, and then homeDirectory, so a directory
+# holding the homes of a UNIX deployment is used as it stands.
+#
+# [[domain_controller]]
+# ...
+# kdcs = ["dc1.eu.example"]
+# home_base = "https://homes.example.net/cdmi/3.0.0/"
+# [domain_controller.userinfo_attributes]
+# home = "labeledURI"
+# email = "mail"
+
+# Service discovery (ECR-224A). The cdmi_domain_doh item hands a client the DoH
+# resolver at which to begin DNS-SD discovery, and the browsing domains to
+# search; the client then browses _cdmi._tcp in each, reads each host's
+# /.well-known/cdmi/cdmi_namespaces/ tree, and mounts a base URI.
+#
+# The item is a proposed addition and not one revision 365 defines, so it is
+# refused unless doh is set here: a cdmi_ name the document does not give is
+# the document's to give, and a deployment that wants this one says so. The
+# capability of the same name is published at the root of the capability
+# hierarchy while it is set, and nowhere while it is not.
+#
+# seedmi speaks no DNS at all. The records this leads a client to are published
+# by seedmi-mdns, which advertises this server on the local link, and by
+# seedmi-zone, which puts what it hears there into a real DNS zone.
+#
+# A resolver given here is written onto the root domain object at startup where
+# the object carries none; a value a client has since set is left alone.
+#
+# [discovery]
+# doh = true
+# resolver = "https://resolver.example.com/dns-query"
+# browse_domains = ["local", "eng.example.com"]

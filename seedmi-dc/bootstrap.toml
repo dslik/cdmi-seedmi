@@ -1,0 +1,68 @@
+# seedmi-dc: an example bootstrap file.
+#
+#   node src/dc-import.ts --config dc-us.toml --from bootstrap.toml
+#
+# This file holds a directory and nothing else. Where the store is, the ranges
+# numbers are allocated from, the realm and the key server all come from the
+# configuration, so the two files cannot disagree about them; a setting that is
+# not one of the three tables below is refused rather than ignored, so a
+# configuration handed to --from by mistake is refused rather than importing
+# nothing.
+#
+# An import is a one-time step. A store that already holds a principal is
+# refused: afterwards the directory is changed through the administrative
+# interface, not by editing this file and running the program again.
+
+# The organizational units, as a tree. parent is the path of the unit above,
+# as "eng" or "eng/platform"; a unit may be named before its parent.
+[[ou]]
+name = "eng"
+description = "Engineering"
+
+[[ou]]
+name = "platform"
+parent = "eng"
+
+# Groups, which may belong to groups. A group is created before the users that
+# name it, so order here does not matter.
+[[group]]
+name = "staff"
+
+[[group]]
+name = "storage-admins"
+groups = ["staff"]
+display_name = "Storage administrators"
+
+# Users. A password is given in the clear here, and nothing of it is kept: the
+# import derives the scrypt verifier a bind is checked against and the Kerberos
+# long-term key for each enctype the realm serves, writes both to the key
+# server, and keeps neither.
+#
+# password_hash takes a hash --hash-password printed instead, for a directory
+# moved out of an older configuration file. What is lost is said rather than
+# hidden: a Kerberos key comes from a password and not from its hash, so a
+# principal imported with a hash binds and is issued tokens and is issued no
+# ticket until a password is set through the administrative interface.
+[[user]]
+name = "alice"
+password = "alice-us"
+groups = ["storage-admins"]
+ou = "eng/platform"
+display_name = "Alice Example"
+home = "/home/alice"
+# An S3 key pair, whose secret this program prints once and never again: the
+# directory keeps the access key identifier and a reference to the secret.
+s3 = true
+
+[[user]]
+name = "bob"
+password = "bob-us"
+groups = ["staff"]
+ou = "eng"
+# disabled = true
+# expires = "2027-01-01T00:00:00Z"
+# A client certificate that authenticates this principal: public material, so
+# nothing of it goes to the key server, and it is the one credential that still
+# works while the key server is away.
+# certificate = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+# certificate_subject = "CN=bob,O=Example"

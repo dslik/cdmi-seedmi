@@ -1,0 +1,168 @@
+# seedmi-dc: an example configuration for the realm US.EXAMPLE. Paths are
+# relative to this file. Several instances run side by side, each with a
+# configuration like this one: its own realm, ports and directory. SIGHUP reads
+# it again; a configuration with a mistake leaves the one in use.
+
+[realm]
+# The realm's name, in upper case as Kerberos gives it, and its DNS domain,
+# from which the LDAP base is formed (dc=us,dc=example).
+name = "US.EXAMPLE"
+domain = "us.example"
+
+[listen]
+host = "127.0.0.1"
+port = 8646          # HTTPS: /health
+ldap_port = 8647     # LDAP over TLS
+# A cleartext LDAP listener where a client installs the TLS layer with StartTLS
+# (RFC 4511 section 4.14), which RFC 4513 section 2 makes a MUST for a server
+# offering more than an anonymous simple bind. Until the layer is there the
+# session serves the root DSE — so StartTLS can be discovered — and refuses
+# everything else with confidentialityRequired. Omit it for LDAPS alone.
+# ldap_starttls_port = 8648
+certificate_file = "pki/https.crt"
+key_file = "pki/https.key"
+
+# The directory. A password is given as the hash --hash-password prints:
+#   echo 'a password' | node src/dcd.ts --hash-password
+# A plain "password" is taken for a demonstration, and warned of in the log.
+# A user or group names the groups it belongs to; groups nest, without cycles.
+
+[[group]]
+name = "staff"
+
+[[group]]
+name = "storage-admins"
+groups = ["staff"]
+
+[[user]]
+name = "alice"
+password = "alice-us"
+groups = ["storage-admins"]
+
+[[user]]
+name = "bob"
+password = "bob-us"
+groups = ["staff"]
+# disabled = true
+# expires = "2027-01-01T00:00:00Z"
+
+# Tokens: an OAuth 2.0 authorization server for the realm, at /token, with its
+# keys at /jwks and its metadata at /.well-known/oauth-authorization-server.
+# The issuer is the controller's URL as clients reach it. Replacing the signing
+# key: generate a new one, name it here, move the old key's public half to
+# previous_keys, and send SIGHUP; drop it once its tokens have expired.
+[tokens]
+issuer = "https://127.0.0.1:8646/"
+signing_key_file = "pki/token-signing.key"
+previous_keys = []
+lifetime_seconds = 3600
+
+# A client that may ask for tokens: its secret as --hash-password prints it (a
+# plain secret is taken for a demonstration, and warned of), the grants it may
+# use, and the audiences it may ask a token for, the first by default.
+[[client]]
+id = "seedmi"
+secret = "seedmi-us"
+grants = ["password", "client_credentials", "urn:ietf:params:oauth:grant-type:token-exchange"]
+audiences = ["https://127.0.0.1:8443/cdmi/3.0.0/"]
+
+# Another realm whose tokens this controller exchanges for its own, so that a
+# server of that realm reaches this one's servers for its principals (a
+# delegated import): its issuer, whose metadata names its keys, and the
+# authority for its certificate. Its principals are named with their realm,
+# alice@EU.EXAMPLE, as are their groups. Trust is not transitive: a
+# principal that realm obtained from a third is not exchanged. A client that
+# exchanges such tokens names, in subject_audiences, the audiences they must
+# have been issued for, so that it exchanges only the tokens issued to it.
+#
+# [[trust]]
+# realm = "EU.EXAMPLE"
+# issuer = "https://127.0.0.1:8636/"
+# ca_file = "pki/https.crt"
+#
+# [[client]]
+# id = "seedmi-eu"
+# secret = "seedmi-eu-exchange"
+# grants = ["urn:ietf:params:oauth:grant-type:token-exchange"]
+# audiences = ["https://127.0.0.1:8443/cdmi/3.0.0/"]
+# subject_audiences = ["https://127.0.0.1:9443/cdmi/3.0.0/"]
+
+# A client of the SCIM administrative interface. The scopes it may be issued:
+# dc.read reads the directory, dc.admin writes it, and a client is given both
+# where it needs both — dc.admin does not include dc.read. A client that asks for
+# a scope it may not have is refused rather than issued a narrower token.
+#
+# The audience is **this controller's own** /scim/v2/, the issuer above with that
+# path: a token is accepted at that interface only if it names it (RFC 8725 §3.9).
+# While the audience was not checked, a token issued to any other service of this
+# realm — a storage node, say — administered the directory; the example here
+# named a port that was never this controller's, which is how that was noticed.
+#
+# [[client]]
+# id = "dcadmin"
+# secret_hash = "scrypt$..."
+# grants = ["client_credentials"]
+# audiences = ["https://127.0.0.1:8646/scim/v2/"]
+# scopes = ["dc.read", "dc.admin"]
+
+# How memberOf is served. "transitive", the default, holds every group a user
+# belongs to, nesting followed; "direct" holds the groups the user names alone,
+# as Active Directory's does, leaving a CDMI server to resolve the rest. Every
+# group carries the groups it belongs to either way, which is how it does so.
+#
+# [directory]
+# memberof = "transitive"
+
+# A directory kept in a store, which the administrative interface writes
+# (DESIGN-admin.md). Where store is given, the [[user]] and [[group]] tables
+# above are refused — this file is then a bootstrap and not a second source of
+# truth — and the first users get in with
+#
+#   node src/dc-import.ts --config dc-us.toml --from bootstrap.toml
+#
+# The ranges are where POSIX numbers are allocated from. There is no default: a
+# number is allocated once and never reissued, so a range of this program's
+# choosing would collide with whatever numbers the deployment's hosts use. Give
+# the two the same range for one space of numbers, or ranges that do not meet.
+#
+# [directory]
+# store = "./dc-data"
+# uid_range = [200000, 299999]
+# gid_range = [300000, 399999]
+
+# Where the secret material of a store's principals is kept: a KMIP 1.4 key
+# management server, reached over TLS with the certificate given here, which is
+# how the Basic Authentication Suite identifies a client. Required where a store
+# is given. key_cache_seconds is the window in which a key destroyed at the
+# server still works here, because a ticket request needs the key and the server
+# serves no Decrypt; it is stated in the log at start.
+#
+# [kms]
+# host = "127.0.0.1"
+# port = 5696
+# certificate_file = "pki/seedmi-dc.pem"
+# key_file = "pki/seedmi-dc.key"
+# authority_file = "pki/ca.pem"
+# key_cache_seconds = 300
+
+# Who may write the directory. An administrator binds over LDAP by SASL EXTERNAL
+# with a client certificate the authority here issued and naming one of the
+# subjects; there is no administrator password anywhere, and no principal of the
+# directory becomes an administrator by being in a group.
+#
+# The subjects are compared as sets of attributes, so the order a library prints
+# them in does not matter; an extra attribute is a different subject. An authority
+# without subjects is refused: it would admit every certificate it ever issues.
+#
+# Without this block every write is refused, whether or not a store holds the
+# directory — a deployment that forgot the authority is not quietly open. It is
+# also the one credential that keeps working while the key management server is
+# away, so an administrator can read and repair the directory then.
+#
+# [admin]
+# authority_file = "pki/admin-ca.pem"
+# subjects = ["CN=dcadmin,O=Example"]
+
+[log]
+level = "problems"
+format = "text"

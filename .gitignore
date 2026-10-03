@@ -1,0 +1,6 @@
+# Exclude documentation build directories
+**/_build
+**/__pycache__
+
+# Exclude MacOS nuisance files
+.DS_Store

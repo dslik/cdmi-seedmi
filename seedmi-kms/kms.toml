@@ -1,0 +1,95 @@
+# seedmi-kms: an example configuration.
+#
+#   node src/kmsd.ts --config kms.toml
+#
+# Nothing here is CDMI: this program serves KMIP 1.4 to any client that
+# presents a certificate the configured authority issued.
+
+[server]
+# The address and port to listen on. 5696 is the port KMIP registers.
+host = "127.0.0.1"
+port = 5696
+# The certificate this server presents and its private key, and the authority
+# whose certificates identify its clients. Each may be given inline instead,
+# as cert, key and ca. These are the files node src/kms-pki.ts --out pki writes,
+# for trying the server on one machine.
+cert_file = "pki/server.pem"
+key_file = "pki/server.key"
+ca_file = "pki/ca.pem"
+# What this server calls itself in a Query response.
+vendor = "seedmi-kms"
+
+[store]
+# The directory the managed objects live in, created where it does not exist.
+path = "./kms-data"
+
+[log]
+# "off" logs nothing, "problems" logs refusals, "requests" logs every
+# operation. A log never carries key material or a secret.
+level = "problems"
+# format = "json"
+# file = "./kms.log"
+
+# Prefixes. A client claims a prefix of the Name space by registering an
+# object beneath it where no other client holds it, and holds it thereafter;
+# another client may neither register beneath it nor claim a prefix that
+# would enclose it. The prefix of a Name is everything to its last "/".
+#
+# A shared prefix is claimed by no one: any client may register beneath it,
+# and each object there belongs to the client that created it. A deployment
+# names one where several clients keep objects of the same form side by
+# side. CDMI servers keep their scope binding keys under "cdmi_binding/", so a
+# key management server used by more than one CDMI server shares it; without
+# that, the first CDMI server to claim a scope would hold the prefix of every
+# binding key.
+[[shared]]
+prefix = "cdmi_binding/"
+
+# Admission. By default only the client that created an object may act on it.
+# An [[admit]] table lets another client act on an object it does not own. What
+# it admits is named by a prefix of the object's Name, by an Object Group the
+# object is in, or by both — and where both are given, both have to match. A
+# group is the value of the attribute, compared whole; a prefix ends with "/".
+#
+# The group is for the case a prefix cannot express: a client that keeps several
+# kinds of material under one prefix, one kind of which another client is to
+# read. A seedmi-dc domain controller keeps a password verifier, a Kerberos key
+# and an S3 secret for each principal beneath "seedmi-dc/", each in an object
+# group naming the kind, and a CDMI server needs the S3 secrets alone:
+#
+#   [[admit]]
+#   prefix = "seedmi-dc/"
+#   group = "seedmi-dc/s3"
+#   identity = "seedmi"
+#   degree = "read"
+#
+# The degrees, each including the ones before:
+#
+#   none      nothing; the default
+#   discover  Locate, Get Attributes, Get Attribute List
+#   use       and the operations performed in place: Sign, Verify, Encrypt,
+#             Decrypt, MAC, Derive Key; the key never leaves the server
+#   read      and Get, which retrieves the material itself
+#   write     and Register beneath the prefix, Add, Modify and Delete
+#             Attribute, Activate, Revoke, Re-key
+#
+# Destroy stays with the client that created the object at every degree.
+# identity = "*" admits every authenticated client. Admission does not transfer
+# a prefix: its holder keeps it. A grant naming a group alone does not let a
+# client register beneath a prefix it does not hold — the object does not exist
+# yet at that point, so its groups are whatever the request claims, and claiming
+# a granted group is not a way into another client's prefix.
+#
+# Two CDMI servers sharing a scope: every server may use a binding key, which
+# is enough to verify a binding without retrieving the key, and a second
+# server may read the credentials of the scope the first one claimed.
+[[admit]]
+prefix = "cdmi_binding/"
+identity = "*"
+degree = "use"
+
+# [[admit]]
+# prefix = "cdmi/tenant-a/"
+# identity = "seedmi-b"
+# degree = "read"
+
