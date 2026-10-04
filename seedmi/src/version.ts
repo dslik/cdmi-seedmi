@@ -7,4 +7,4 @@
 //
 // This is the version of the implementation, not of the CDMI
 // specification it implements (3.0.0, sent in X-CDMI-Specification-Version).
-export const VERSION = "0.127";
+export const VERSION = "0.128";

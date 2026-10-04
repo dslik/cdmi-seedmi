@@ -3,11 +3,11 @@
 A CDMI 3.0 server and the programs it is deployed with, written to find defects
 in the specification by implementing it closely.
 
-Version 0.127. Six programs, side by side, **sharing no file**:
+Version 0.128. Six programs, side by side, **sharing no file**:
 
 | Directory | Program | Version |
 |---|---|---|
-| [`seedmi/`](seedmi/) | a CDMI 3.0 server: the reference implementation of the specification | 0.127.0 |
+| [`seedmi/`](seedmi/) | a CDMI 3.0 server: the reference implementation of the specification | 0.128.0 |
 | [`seedmi-kms/`](seedmi-kms/) | a KMIP 1.4 key management server, run and configured on its own | 1.1.0 |
 | [`seedmi-dac/`](seedmi-dac/) | a delegated access control provider, which decides an access a CDMI server refers to it | 0.11.0 |
 | [`seedmi-dc/`](seedmi-dc/) | a domain controller: LDAP, SCIM, OAuth and a key distribution centre, at which a CDMI server resolves the principals of a domain | 1.4.0 |
@@ -68,6 +68,8 @@ curl -s -X PUT -H 'Content-Type: application/cdmi-object' \
   -d '{"value":"hello"}' http://127.0.0.1:8080/cdmi/3.0.0/greeting.txt
 curl -s 'http://127.0.0.1:8080/cdmi/3.0.0/greeting.txt?value'
 ```
+
+That answers `200`, `201` and `200`.
 
 `seedmi.toml` is a commented example of a configuration file, and it **does**
 configure principals — `alice` and an administrator `root` — so a request

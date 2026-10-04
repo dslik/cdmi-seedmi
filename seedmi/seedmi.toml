@@ -94,54 +94,46 @@ administrator = true
 # service_credential = "svc-import"
 
 [oauth]
-# The tokens this server accepts from clients. Where server below is true, the
-# issuer and the key are that server's own and are not stated here: a key pair
-# is generated at startup and its public half published as a JWK Set, which is
-# what a client verifying by discovery needs. issuer, algorithm and
-# verify_key(_file) are for a token from an authorization server elsewhere.
+# The access tokens this server accepts. Everything here is about verifying a
+# token an authorization server of the deployment issued: seedmi does not issue
+# one. It ran an authorization server of its own until 0.128, enabled by
+# server = true, and that is gone — a CDMI server is not an authorization
+# server. The settings that configured it are refused by name, so a file
+# written for an earlier release says what became of them.
+#
+# Leave this section out entirely and seedmi authenticates with the Basic
+# scheme against [[user]] alone, which is all a stand-alone server needs.
+#
+# issuer   the authorization server whose tokens are accepted; a token from
+#          any other issuer is refused, however well signed.
+# audience what this server answers to in a token. The MCP endpoint's resource
+#          identifier is an audience of this same server and is added for you.
+# verify_key(_file)
+#          the key a token is verified with: the public half of the pair the
+#          authorization server signs with, or the shared secret. The algorithm
+#          follows it — a PEM key is RS256, characters are HS256 — unless
+#          algorithm states HS256, RS256 or ES256.
+# issuer = "https://as.example/"
 audience = "http://127.0.0.1:8080/cdmi/3.0.0/"
+# verify_key_file = "as-public.pem"
 
-# Where a token is exchanged for one a remote import source accepts,
-# as RFC 8693 defines. Where server is true, seedmi runs one of its own
-# so that a demonstration stands alone; a deployment gives
-# token_endpoint instead and leaves server unset. Where the token endpoint
-# authenticates this server, client_id names it and client_secret_id the name
-# of its credential, held at the root domain's default key management server;
-# the secret itself is never held here. token_endpoint_ca(_file) names the
-# authority for the token endpoint's certificate where the system does not
-# trust it, as for a domain controller's.
+# Where a token is exchanged for one a remote import source accepts, as RFC
+# 8693 defines. This is what delegated identity needs, and without it an import
+# in delegated identity mode is not active for any principal: there is nothing
+# to exchange their token at. Where the token endpoint authenticates this
+# server, client_id names it and client_secret_id the name of its credential,
+# held at the root domain's default key management server; the secret itself is
+# never held here. token_endpoint_ca(_file) names the authority for the token
+# endpoint's certificate where the system does not trust it, as for a domain
+# controller's.
 #
 # Across realms, the token endpoint is that of the import source's realm's
 # domain controller, which trusts this server's realm ([[trust]] in seedmi-dc)
 # and exchanges the token its controller issued for one the source accepts; the
 # principal is named there with its realm, alice@EU.EXAMPLE.
-server = true
-server_port = 8090
-# Where a client reaches that server, which its metadata reports as the issuer,
-# the token endpoint and the JWK Set URI. Its scheme follows
-# server_certificate; without one it is http, which RFC 8414 does not permit
-# for an issuer, so a client that holds that requirement needs a certificate
-# here. Leave it unset and it is derived from the address the server listens on.
-server_base_uri = "http://127.0.0.1:8090"
-# server_certificate = "seedmi-cert"
-# The scopes it will issue. Space-delimited on the wire (RFC 6749); an entry
-# holding a comma or a space is refused.
-server_scopes = ["cdmi:read", "cdmi:write", "cdmi:admin"]
-# sign_key_file = "as.key"  # a PEM private key; a pair is generated without one
+# token_endpoint = "https://as.example/token"
 client_id = "seedmi"
-
-# A client registered with that authorization server. An MCP client asking for
-# a "Resource AS Client ID" and secret wants these, and not a [[user]] name and
-# password. Without any [[oauth_client]] the server accepts any identifier and
-# any secret, which is a demonstration and not a deployment.
-[[oauth_client]]
-id = "mcp-inspector"
-secret = "change-this-to-something-long-and-secret"
-scopes = ["cdmi:read", "cdmi:write"]
-# The principal a token issued to this client names, where it uses the client
-# credentials grant and has no user in front of it. Without this the token names
-# the client, which no access control list grants anything to.
-user = "alice"
+# client_secret_id = "token-service"
 
 [nfs]
 enabled = false

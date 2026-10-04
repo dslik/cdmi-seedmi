@@ -112,33 +112,10 @@ export interface OAuthConfig {
   clientId?: string;
   /** The Name of the token service credential at the root domain's default key management server. */
   clientSecretId?: string;
-  /** Whether to run an authorization server of this server's own. */
-  server: boolean;
-  /** Where that authorization server listens. */
-  serverPort: number;
-  /** The key it signs with, which is also the verify key by default. */
-  signKey?: string;
-  /**
-   * The address that authorization server is reached at, which its RFC 8414
-   * metadata reports as the issuer, the token endpoint and the JWK Set URI.
-   * Where absent it is derived from the address it listens on, which is right
-   * for a test on one host and wrong for anything a client reaches by another
-   * name.
-   */
-  serverBaseUri?: string;
-  /** The scopes that authorization server will issue. */
-  serverScopes?: string[];
-  /** The certificate that authorization server presents, by identifier. */
-  serverCertificate?: string;
-  /** The origins a browser-based client may present to it (cors.ts). */
-  serverOrigins?: string[];
-  /**
-   * The clients registered with that authorization server, from
-   * [[oauth_client]]. A client that presents credentials is authenticated
-   * against this list where it is not empty; where it is empty, the
-   * demonstration server accepts any client, which no deployment should do.
-   */
-  clients: { id: string; secret: string; scopes?: string[]; user?: string }[];
+  // An authorization server of this server's own was configured here until
+  // 0.128 — server, server_port, sign_key, server_base_uri, server_scopes,
+  // server_certificate, server_origins and [[oauth_client]]. Each is now
+  // refused by name: a CDMI server verifies a token and does not issue one.
 }
 
 export interface Config {
@@ -271,7 +248,7 @@ const DEFAULTS: Config = {
   logFormat: "text",
   users: [],
   certificates: [],
-  oauth: { algorithm: "HS256", server: false, serverPort: 0, clients: [] },
+  oauth: { algorithm: "HS256" },
   nfs: { enabled: false, port: 2049, host: "127.0.0.1", mapCredentials: false },
   smb: { enabled: false, port: 445, host: "127.0.0.1" },
   s3Keys: [],
@@ -398,7 +375,7 @@ export function parseConfig(text: string, dir = "."): Config {
     ...DEFAULTS,
     users: [],
     certificates: [],
-    oauth: { ...DEFAULTS.oauth, clients: [] },
+    oauth: { ...DEFAULTS.oauth },
     nfs: { ...DEFAULTS.nfs },
     smb: { ...DEFAULTS.smb },
     s3Keys: [],
@@ -636,26 +613,30 @@ export function parseConfig(text: string, dir = "."): Config {
   c.oauth.tokenEndpoint = r.str(o, "token_endpoint", "[oauth]");
   // The authority for the token endpoint's certificate, where the system does not trust it.
   c.oauth.tokenEndpointCa = r.material(o, "token_endpoint_ca", "[oauth]");
-  c.oauth.server = r.bool(o, "server", "[oauth]") ?? false;
-  c.oauth.serverPort = r.int(o, "server_port", "[oauth]") ?? 0;
+  // The settings of the authorization server this program ran until 0.128.
+  // They are still read, and refused by name rather than by the general
+  // "not a setting this server knows", so that a configuration file written
+  // for an earlier release is told what became of them instead of being told
+  // it holds a typing error.
+  for (const gone of ["server", "server_port", "sign_key", "sign_key_file",
+    "server_base_uri", "server_scopes", "server_certificate", "server_origins"]) {
+    if (o[gone] !== undefined) {
+      throw new ConfigError(`[oauth].${gone} is not a setting of this server since 0.128: a CDMI server is not ` +
+        "an authorization server, and the one this program ran for a demonstration is gone. Name the " +
+        "authorization server of the deployment with [oauth].token_endpoint, and the key its tokens are " +
+        "verified with by [oauth].verify_key or verify_key_file.");
+    }
+  }
   const stated = r.str(o, "algorithm", "[oauth]");
   if (stated !== undefined && !["HS256", "RS256", "ES256"].includes(stated)) {
     throw new ConfigError("[oauth].algorithm shall be HS256, RS256 or ES256");
   }
   c.oauth.verifyKey = r.material(o, "verify_key", "[oauth]");
-  c.oauth.signKey = r.material(o, "sign_key", "[oauth]");
   // Where the algorithm is not stated it follows the key. A PEM key is
   // asymmetric and RS256 is the algorithm of an RSA one; a key given as
-  // characters is a shared secret and HS256 is the only thing it can be. An
-  // asymmetric key is also the only kind whose public half can be published as
-  // a JWK Set, which is how the built-in authorization server's tokens are
-  // verified, so [oauth].server with no key at all generates a pair and is
-  // RS256 too. An HS256 default there would have been a default no relying
-  // party in this deployment could use.
+  // characters is a shared secret and HS256 is the only thing it can be.
   const pem = (k: string | undefined) => k !== undefined && k.includes("-----BEGIN");
-  c.oauth.algorithm = stated ??
-    (pem(c.oauth.signKey) || pem(c.oauth.verifyKey) ||
-      (c.oauth.server && c.oauth.signKey === undefined) ? "RS256" : "HS256");
+  c.oauth.algorithm = stated ?? (pem(c.oauth.verifyKey) ? "RS256" : "HS256");
   c.oauth.clientId = r.str(o, "client_id", "[oauth]");
   // The credential with which this server authenticates to the security
   // token service is one of its own, named here and held at the root domain's
@@ -670,108 +651,14 @@ export function parseConfig(text: string, dir = "."): Config {
       "which is not empty and holds no /");
   }
   c.oauth.clientSecretId = secretName;
-  // [oauth].server no longer requires a sign_key: where none is given the
-  // authorization server generates a key pair at startup and publishes its
-  // public half as a JWK Set, which is what a client that verifies by
-  // discovery needs and what nothing here could supply while the only key was
-  // a shared secret.
-  if (c.oauth.server && c.oauth.signKey !== undefined && c.oauth.algorithm === "HS256") {
-    throw new ConfigError("[oauth].server with an HS256 sign_key cannot publish a JWK Set, so no client that " +
-      "verifies by discovery can accept its tokens; give a PEM private key, or none, and let it generate one");
-  }
-  c.oauth.serverCertificate = r.str(o, "server_certificate", "[oauth]");
-  if (c.oauth.serverCertificate !== undefined) {
-    if (!c.certificates.some((x) => x.id === c.oauth.serverCertificate)) {
-      throw new ConfigError(
-        `[oauth].server_certificate names the certificate ${JSON.stringify(c.oauth.serverCertificate)}, ` +
-        "which is not configured");
-    }
-    if (!c.oauth.server) {
-      throw new ConfigError("[oauth].server_certificate is the certificate the authorization server of this " +
-        "server's own presents, which [oauth].server does not start");
-    }
-  }
-  c.oauth.serverBaseUri = r.str(o, "server_base_uri", "[oauth]");
-  if (c.oauth.serverBaseUri !== undefined) {
-    if (!/^https?:\/\//.test(c.oauth.serverBaseUri)) {
-      throw new ConfigError("[oauth].server_base_uri shall be an http or https URI");
-    }
-    c.oauth.serverBaseUri = c.oauth.serverBaseUri.replace(/\/+$/, "");
-    // The scheme is what a client reaches the server by, so it shall be the
-    // scheme the server serves: a base URI saying https where the server
-    // presents no certificate sends every client to a port that will not
-    // complete a handshake, and one saying http where it does presents a
-    // metadata document no client following RFC 8414 will accept.
-    const wanted = c.oauth.serverCertificate === undefined ? "http" : "https";
-    if (!c.oauth.serverBaseUri.startsWith(`${wanted}://`)) {
-      throw new ConfigError(`[oauth].server_base_uri shall be a ${wanted} URI, because ` +
-        (c.oauth.serverCertificate === undefined
-          ? "[oauth].server_certificate names no certificate for that server to present"
-          : `[oauth].server_certificate names ${JSON.stringify(c.oauth.serverCertificate)}, ` +
-            "which it presents"));
-    }
-  }
-  // The origins a browser-based client may present to that server. Everything
-  // it serves is fetched cross-origin by such a client, the server being on a
-  // listener of its own; the default is the wildcard, its metadata and JWK Set
-  // being public documents and its token endpoint being guarded by a client
-  // credential rather than by who may read the answer.
-  c.oauth.serverOrigins = r.strings(o, "server_origins", "[oauth]");
-  for (const origin of c.oauth.serverOrigins ?? []) {
-    if (origin === "*") continue;
-    try {
-      if (new URL(origin).origin !== origin) throw new Error("not an origin");
-    } catch {
-      throw new ConfigError(`[oauth].server_origins holds ${JSON.stringify(origin)}, which is not an origin: an ` +
-        'origin is a scheme, a host and a port, as "https://app.example.com", with no path. "*" answers any.');
-    }
-  }
-  c.oauth.serverScopes = r.strings(o, "server_scopes", "[oauth]");
-  if (c.oauth.serverScopes !== undefined) {
-    // RFC 6749 section 3.3: a scope is a space-delimited list of tokens, and a
-    // token holds no space. One written with a comma is one invalid token, and
-    // is refused here rather than at the client that cannot use it.
-    for (const s of c.oauth.serverScopes) {
-      if (s === "" || /[\s,"\\]/.test(s)) {
-        throw new ConfigError(`[oauth].server_scopes holds ${JSON.stringify(s)}, which is not a scope token of ` +
-          "RFC 6749 section 3.3: a token is not empty and holds no space, comma, quotation mark or reverse solidus");
-      }
-    }
-  }
-  if (c.oauth.verifyKey === undefined && c.oauth.signKey !== undefined) {
-    // A server that issues its own tokens verifies them with the same
-    // key, where the algorithm is symmetric.
-    if (c.oauth.algorithm === "HS256") c.oauth.verifyKey = c.oauth.signKey;
-  }
 
-  // [[oauth_client]]: the clients registered with the built-in authorization
-  // server. An MCP client is given one of these as its "Resource AS Client ID"
-  // and secret, and presents them at the token endpoint.
-  for (const t of r.tables(doc.oauth_client, "[[oauth_client]]")) {
-    r.only(t, "[[oauth_client]]", ["id", "secret", "scopes", "user"]);
-    const id = r.need(t, "id", "[[oauth_client]]");
-    if (c.oauth.clients.some((x) => x.id === id)) {
-      throw new ConfigError(`[[oauth_client]] gives the identifier ${id} twice`);
-    }
-    const scopes = r.strings(t, "scopes", "[[oauth_client]]");
-    // The principal a token issued to this client names, as [[s3_key]].user
-    // names the principal an access key acts as. It shall be a configured one:
-    // a token naming a principal this server cannot resolve is one every
-    // object refuses, and saying so here is better than at the first call.
-    const user = r.str(t, "user", "[[oauth_client]]");
-    if (user !== undefined && !c.users.some((u) => u.name.toLowerCase() === user.toLowerCase())) {
-      throw new ConfigError(`[[oauth_client]] ${id} acts as ${JSON.stringify(user)}, which is not a [[user]]`);
-    }
-    c.oauth.clients.push({
-      id,
-      secret: r.need(t, "secret", "[[oauth_client]]"),
-      ...(scopes === undefined ? {} : { scopes }),
-      ...(user === undefined ? {} : { user }),
-    });
-  }
-  if (c.oauth.clients.length > 0 && !c.oauth.server) {
-    throw new ConfigError("[[oauth_client]] registers a client with the authorization server of this server's own, " +
-      "which [oauth].server does not start");
+  // [[oauth_client]] registered a client with that authorization server. A
+  // deployment registers its clients with its own.
+  if (r.tables(doc.oauth_client, "[[oauth_client]]").length > 0) {
+    throw new ConfigError("[[oauth_client]] is not a setting of this server since 0.128: it registered a " +
+      "client with the authorization server this program ran for a demonstration, which is gone. Register " +
+      "the client with the authorization server of the deployment, and name that server's token endpoint " +
+      "with [oauth].token_endpoint.");
   }
 
   const nfs = r.table(doc.nfs, "[nfs]");

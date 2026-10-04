@@ -17,7 +17,6 @@ import { ownBases, setSelfBases } from "./imports.ts";
 import { setServiceCredential, setImportSecretResolver, setDelegation } from "./layers.ts";
 import { ANONYMOUS, defaultRootACL, type Principal } from "./acl.ts";
 import { SmbServer } from "./smb-server.ts";
-import { AuthServer } from "./oauth.ts";
 import { TLSServer } from "./tls.ts";
 import { Discovery } from "./discovery.ts";
 import { Mcp, setVersion as setMcpVersion } from "./mcp.ts";
@@ -233,75 +232,20 @@ const principalOf = (name: string): Principal | undefined => {
     "Basic " + Buffer.from(`${u.name}:${u.password}`, "utf8").toString("base64"));
 };
 
-// An authorization server of this server's own, so that a demonstration
-// of delegated identity stands on its own. A deployment uses one of its
-// own and gives [oauth].token_endpoint instead.
-let auth: AuthServer | undefined;
-if (config.oauth.server) {
-  const authPair = config.oauth.serverCertificate === undefined
-    ? undefined
-    : certificateOf(config, config.oauth.serverCertificate);
-  auth = new AuthServer({
-    // Where no base URI is configured the authorization server derives one
-    // from the address it listens on, and its issuer is that same string:
-    // RFC 8414 makes the issuer the URL its metadata is served from, and a
-    // client that verifies a token by discovery follows the "iss" claim to
-    // find it. Stating [oauth].issuer as something else is only right where
-    // the deployment serves the metadata there too.
-    ...(config.oauth.serverBaseUri === undefined
-      ? (config.oauth.issuer === undefined ? {} : { issuer: config.oauth.issuer })
-      : { baseUri: config.oauth.serverBaseUri, issuer: config.oauth.serverBaseUri }),
-    ...(config.oauth.signKey === undefined ? {} : { signKey: config.oauth.signKey }),
-    algorithm: config.oauth.algorithm,
-    users: config.users.map((u) => ({
-      name: u.name,
-      password: u.password,
-      groups: u.groups,
-    })),
-    clients: config.oauth.clients,
-    ...(config.oauth.serverScopes === undefined ? {} : { scopes: config.oauth.serverScopes }),
-    // The certificate it presents, where [oauth].server_certificate names one.
-    // Without one its issuer is an http URI, which RFC 8414 does not permit and
-    // a client that enforces that refuses to discover.
-    ...(authPair === undefined ? {} : { certificate: { cert: authPair.chain, key: authPair.key } }),
-    ...(config.oauth.serverOrigins === undefined ? {} : { origins: config.oauth.serverOrigins }),
-  });
-  await auth.listen(config.oauth.serverPort, config.host);
-  // What an MCP client needs to be told, said once at startup: the issuer it
-  // discovers from, the endpoint it obtains a token at, and whether it must
-  // present a client credential. Nothing said any of it before 0.88, so a
-  // deployment had to read the source to find the port the server had been
-  // given by the system.
-  console.log(`seedmi: an authorization server of this server's own at ${auth.baseUri}, ` +
-    `signing ${auth.opts.algorithm}` +
-    (auth.signingJwk === undefined
-      ? " with a shared secret, which publishes no JWK Set"
-      : ` with the key ${auth.signingJwk.kid}, published at ${auth.jwksUri}`));
-  if (authPair === undefined) {
-    console.warn("seedmi: [oauth].server_certificate names no certificate, so that authorization server is plain " +
-      "HTTP and its issuer is an http URI. RFC 8414 requires an https issuer and RFC 6749 an https token " +
-      "endpoint, so a client that holds either will not use it, and a client secret travels in the clear.");
-  }
-  console.log(`seedmi: its metadata is at ${auth.baseUri}/.well-known/oauth-authorization-server, ` +
-    `its token endpoint is ${auth.tokenEndpoint}, and it issues the scopes ${auth.opts.scopes.join(" ")}`);
-  if (config.oauth.clients.length === 0) {
-    console.warn("seedmi: no [[oauth_client]] is registered, so that authorization server accepts any client " +
-      "identifier and any secret. That is a demonstration, not a deployment.");
-  } else {
-    console.log(`seedmi: ${config.oauth.clients.length} [[oauth_client]] entries are registered with it: ` +
-      config.oauth.clients.map((x) => x.id).join(", "));
-  }
-}
+// An authorization server of this server's own stood here until 0.128, run by
+// [oauth].server so that delegated identity could be demonstrated without an
+// external party. A CDMI server is not an authorization server, and a program
+// that can mint a credential is a different thing to operate from one that can
+// only verify, so it is gone. A deployment names its own authorization server
+// with [oauth].token_endpoint and [oauth].verify_key, which is what every
+// deployment did in any case; the tests use `oauth-stub.ts`, which is not part
+// of the release.
 
-const tokenEndpoint = config.oauth.tokenEndpoint ?? auth?.tokenEndpoint;
-// The key an incoming token is verified with. Where this server runs an
-// authorization server of its own, that is the public half of the key it
-// generated or was given — not [oauth].verify_key, which for an asymmetric
-// key the deployment has no way of knowing when the pair is generated at
-// startup. The issuer and algorithm follow the same source, so that a token
-// the built-in server minted is one the HTTP binding accepts: before 0.88 it
-// was verified against a key the configuration had to supply, so an
-// asymmetric built-in server issued tokens its own binding refused.
+const tokenEndpoint = config.oauth.tokenEndpoint;
+// The key an incoming token is verified with, from the configuration: the
+// public half of the key the deployment's authorization server signs with, or
+// the shared secret. Until 0.128 it could also come from the built-in server,
+// whose generated public half no configuration could state.
 //
 // The audiences it answers to are every resource identifier of this one server:
 // "The CDMI server shall be the MCP server. The two are one server", so a
@@ -314,19 +258,12 @@ const audiences = [
   ...(config.oauth.audience === undefined ? [] : [config.oauth.audience]),
   ...(config.mcp === undefined ? [] : [config.mcp.uri]),
 ];
-const verifying = auth === undefined
-  ? (config.oauth.verifyKey === undefined ? undefined : {
-    key: config.oauth.verifyKey,
-    algorithm: config.oauth.algorithm,
-    issuer: config.oauth.issuer,
-    audience: audiences,
-  })
-  : {
-    key: auth.verifyKey,
-    algorithm: auth.opts.algorithm,
-    issuer: auth.issuer,
-    audience: audiences,
-  };
+const verifying = config.oauth.verifyKey === undefined ? undefined : {
+  key: config.oauth.verifyKey,
+  algorithm: config.oauth.algorithm,
+  issuer: config.oauth.issuer,
+  audience: audiences,
+};
 if (verifying !== undefined) binding.directory.tokens = verifying;
 setDelegation(tokenEndpoint === undefined ? undefined : {
   tokenEndpoint,
@@ -614,7 +551,6 @@ if (smb) console.log(`seedmi: SMB at ${config.smb.host}:${config.smb.port}`);
 if (config.s3Keys.length > 0) {
   console.log(`seedmi: ${config.s3Keys.length} S3 access key(s)`);
 }
-if (auth) console.log(`seedmi: an authorization server at ${auth.tokenEndpoint}`);
 if (binding.discovery) {
   console.log(`seedmi: a discovery tree at /.well-known/cdmi/`);
 }
@@ -861,7 +797,6 @@ const stop = async () => {
   await tls?.close();
   await nfs?.close();
   await smb?.close();
-  await auth?.close();
   for (const k of keyManagement) await k.close();
   store.close();
   process.exit(0);
