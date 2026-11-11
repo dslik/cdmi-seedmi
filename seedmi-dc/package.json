@@ -1,1 +1,9 @@
-{"name":"seedmi-dc","version":"1.4.0","private":true,"type":"module"}
+{
+  "name": "seedmi-dc",
+  "version": "1.12.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test \"src/*.test.ts\""
+  }
+}

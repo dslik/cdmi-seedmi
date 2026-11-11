@@ -10,8 +10,17 @@ name = "EU.EXAMPLE"
 domain = "eu.example"
 
 [listen]
+# The browser origins that may read this controller's answers. A page that
+# follows RFC 9728 to this authorization server fetches its metadata, its JWK
+# Set and its token endpoint from another origin, this being a listener of its
+# own, and without these the browser discards answers this controller returns
+# correctly. Each an absolute origin, or "*" for any: the metadata and the JWK
+# Set are public documents and the token endpoint is guarded by a client
+# credential rather than by who may read the answer. Absent, no cross-origin
+# page reads anything, which is what every release before 1.6 did.
+# origins = ["https://desktop.example:9443"]
 host = "127.0.0.1"
-port = 8636          # HTTPS: /health
+port = 8636          # HTTPS: the token endpoint, its metadata and SCIM
 ldap_port = 8637     # LDAP over TLS
 # A cleartext LDAP listener where a client installs the TLS layer with StartTLS
 # (RFC 4511 section 4.14), which RFC 4513 section 2 makes a MUST for a server
@@ -107,3 +116,22 @@ format = "text"
 # name = "alice"
 # password = "alice-eu"
 # home = "/home/alice"
+
+# A public client: a program delivered to a browser or to a desktop, which holds
+# no secret because anyone who has the program has the secret. It gives no
+# secret and no secret_hash, names itself at the token endpoint (RFC 6749
+# section 4.3.2), and is held to the authorization code flow, where what it
+# proves is possession of the verifier whose hash began the request (RFC 7636).
+# It may not use client_credentials, password or token exchange: each of those
+# is a client proving something, and this one cannot.
+#
+# [[client]]
+# id = "desktop"
+# grants = ["authorization_code"]
+# audiences = ["https://files.example.com/cdmi/3.0.0/", "https://files.example.com:8100/mcp"]
+# scopes = ["cdmi:read", "cdmi:write"]
+# The addresses a code may be sent to, matched exactly: a prefix or a wildcard
+# is a way to send somebody else's code somewhere else. Over https, or over http
+# to the loopback address, which RFC 8252 section 7.3 reserves for a program on
+# the same machine listening on a port it cannot choose in advance.
+# redirect_uris = ["https://desktop.example.com:9443/oauth/callback"]

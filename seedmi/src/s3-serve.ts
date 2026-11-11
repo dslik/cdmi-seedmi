@@ -200,6 +200,8 @@ export interface Bucket {
 
 export interface BucketOptions {
   buckets: Bucket[];
+  /** The host names this server's own S3 endpoints are reached at. */
+  hosts?: string[];
   store: Store;
   /** Delegated access control, where this server is configured for it. */
   dac?: DacClient;
@@ -238,23 +240,50 @@ export interface BucketOptions {
 }
 
 /** The bucket a request addresses, and the key within it. */
-export function routeS3(host: string, path: string, buckets: Bucket[]):
-  { bucket: Bucket; key: string; addressedBucket: boolean } | undefined {
-  const label = host.split(":")[0].split(".")[0].toLowerCase();
+/**
+ * The bucket a request addresses, where it addresses one.
+ *
+ * `hosts` are the host names this server's own S3 endpoints are reached at,
+ * without a port: "the bucket is addressed as a path segment of an endpoint",
+ * and "an S3 client combines an endpoint with the bucket_name field in the
+ * manner given by the addressing_style field" (revision 365). A request that
+ * arrived at some other authority this server answers on -- the host of an
+ * HTTP export, say -- reached no S3 endpoint and therefore addresses no
+ * bucket, whatever its first path segment happens to be.
+ *
+ * Until this was scoped, a path style bucket was matched against the first
+ * segment of every request on every host. A bucket named "docs" shadowed that
+ * segment across every HTTP export of the same listener, so a client reading
+ * an object within its own export was answered with an S3 AccessDenied
+ * document in XML for an object it was entitled to read. Where `hosts` is
+ * empty the old behaviour stands, so a caller that knows no host -- a unit
+ * test of the routing alone -- is unaffected.
+ */
+export function routeS3(host: string, path: string, buckets: Bucket[],
+  hosts: string[] = []): { bucket: Bucket; key: string; addressedBucket: boolean } | undefined {
+  const name = host.split(":")[0].toLowerCase();
+  const known = hosts.map((h) => h.toLowerCase());
+  const label = name.split(".")[0];
+  // The name with its first label removed, which is the endpoint a virtual
+  // hosted request reaches: the bucket is a subdomain of that endpoint.
+  const parent = name.split(".").slice(1).join(".");
+  const at = (which: string) => known.length === 0 || known.includes(which);
   // Virtual hosted addressing: the bucket is a subdomain of an
   // endpoint, and the whole path is the key.
   for (const b of buckets) {
     if (b.entry.addressing_style === "path") continue;
     if (b.entry.bucket_name !== label) continue;
+    if (!at(parent)) continue;
     const key = decodeURIComponent(path.replace(/^\//, ""));
     return { bucket: b, key, addressedBucket: key === "" };
   }
-  // Path style addressing: the bucket is the first segment.
+  // Path style addressing: the bucket is the first segment of an endpoint.
   const segs = path.replace(/^\//, "").split("/");
   const first = decodeURIComponent(segs[0] ?? "");
   for (const b of buckets) {
     if (b.entry.addressing_style === "virtual_hosted") continue;
     if (b.entry.bucket_name !== first) continue;
+    if (!at(name)) continue;
     const key = segs.slice(1).map((s) => decodeURIComponent(s)).join("/");
     return { bucket: b, key, addressedBucket: key === "" };
   }
@@ -302,7 +331,7 @@ export async function serveBucket(req: IncomingMessage, res: ServerResponse,
   const path = at < 0 ? url : url.slice(0, at);
   const query = at < 0 ? "" : url.slice(at + 1);
   const host = (req.headers.host as string | undefined) ?? "";
-  const routed = routeS3(host, path, o.buckets);
+  const routed = routeS3(host, path, o.buckets, o.hosts ?? []);
   if (routed === undefined) return false;
 
   const { bucket, key, addressedBucket } = routed;

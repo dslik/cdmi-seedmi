@@ -56,8 +56,20 @@ export interface DomainControllerConfig {
   ca: string;
   /** The issuer of the bearer tokens this domain accepts, or undefined where it accepts none. */
   issuer?: string;
-  /** This server, as the audience of those tokens. */
-  audience?: string;
+  /**
+   * This server, as the audience of those tokens: the identifier the
+   * `[[domain_controller]]` table states, together with every other resource
+   * identifier of this one server, which `main.ts` adds. A token naming any of
+   * them was obtained for this server.
+   *
+   * It was one identifier until 0.129, and the one the table states, so a token
+   * obtained for the MCP endpoint — which is what RFC 9728 tells a client to
+   * ask for, and what the endpoint publishes as its resource — was accepted at
+   * the transport by `mcp-auth.ts` and refused here at the operation. 0.88
+   * settled this for the `[oauth]` path and left this one matching a single
+   * value; the judgement is now made once, in `main.ts`, for both.
+   */
+  audience?: string | string[];
   cacheSeconds: number;
   timeoutMs: number;
   /**
@@ -179,6 +191,17 @@ export function authenticationUnavailable(detail: string): Condition {
 class Unreachable extends Error {}
 
 // --- LDAP, the few messages needed -----------------------------------------
+
+/**
+ * The DNS domain an LDAP base names: "dc=eu,dc=example" is "eu.example". Only
+ * a base made of domain components names one; anything else names none, and a
+ * deployment whose entries are held elsewhere qualifies by its realm alone.
+ */
+function domainOf(base: string): string | undefined {
+  const parts = base.split(",").map((p) => p.trim());
+  if (parts.length === 0 || !parts.every((p) => /^dc=[A-Za-z0-9][A-Za-z0-9-]*$/i.test(p))) return undefined;
+  return parts.map((p) => p.slice(3)).join(".").toLowerCase();
+}
 
 function tlv(tag: number, content: Buffer): Buffer {
   const n = content.length;
@@ -973,9 +996,26 @@ export class DomainController {
     const decoded = Buffer.from(encoded, "base64").toString("utf8");
     const cut = decoded.indexOf(":");
     if (cut < 0) return undefined;
-    const name = decoded.slice(0, cut), password = decoded.slice(cut + 1);
+    const supplied = decoded.slice(0, cut), password = decoded.slice(cut + 1);
     // A name the controller's directory could hold, and never an empty password,
     // which LDAP would take as an unauthenticated bind (RFC 4513 section 5.1.2).
+    //
+    // A principal of this deployment is named three ways — bare, qualified by
+    // the realm, and qualified by the realm's DNS domain — and is resolved to
+    // the qualified form, which is what an access control entry and an owner
+    // name. Until 0.129 this pattern admitted no commercial at, so every
+    // qualified form was refused here, before any request reached the
+    // controller, and answered "the credentials presented are not accepted by
+    // the domain's controller" — which names a decision the controller never
+    // made. The suffix is checked against this domain's own names, so a name of
+    // somewhere else is still refused rather than quietly stripped to one that
+    // is here.
+    const at = supplied.lastIndexOf("@");
+    const suffix = at <= 0 ? undefined : supplied.slice(at + 1).toLowerCase();
+    const mine = [this.config.realm, domainOf(this.config.base)]
+      .filter((s): s is string => s !== undefined && s !== "").map((s) => s.toLowerCase());
+    if (suffix !== undefined && !mine.includes(suffix)) return undefined;
+    const name = suffix === undefined ? supplied : supplied.slice(0, at);
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) || password === "") return undefined;
     const attributes: Record<string, string> = {};
     const groups = await ldapGroups(this.config, this.entryOf(name), password, undefined, undefined,
@@ -1016,7 +1056,13 @@ export class DomainController {
       return undefined;
     }
     const aud = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
-    if (claims.iss !== this.config.issuer || !aud.includes(this.config.audience) || typeof claims.sub !== "string" ||
+    // Every resource identifier of this one server, as the field says. Where
+    // the table names none, this is empty and no token is accepted, which is
+    // what matching an undefined audience did.
+    const answersTo = this.config.audience === undefined ? []
+      : Array.isArray(this.config.audience) ? this.config.audience : [this.config.audience];
+    if (claims.iss !== this.config.issuer || !aud.some((a) => answersTo.includes(a as string)) ||
+        typeof claims.sub !== "string" ||
         typeof claims.exp !== "number" || claims.exp * 1000 <= this.now()) {
       return undefined;
     }

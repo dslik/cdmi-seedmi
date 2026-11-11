@@ -1785,6 +1785,10 @@ export class Exports {
     if (placed.length === 0) return false;
     return await serveBucket(req, res, {
       buckets: placed.map((p) => ({ entry: p.entry, node: p.node, ns: p.ns })),
+      // The hosts this server's own S3 endpoints are reached at. A request to
+      // any other authority this server answers on reached no S3 endpoint and
+      // addresses no bucket, however its path reads.
+      hosts: [this.opts.host ?? "127.0.0.1"],
       store: this.store,
       credentials: this.opts.s3Credentials,
       principal: this.opts.s3Principal,

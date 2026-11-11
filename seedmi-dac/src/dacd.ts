@@ -22,7 +22,7 @@ import { authenticate, ReplayWindow } from "./dac-trust.ts";
 import { decide } from "./dac-policy.ts";
 import { deliver, permitted } from "./dac-deliver.ts";
 
-export const VERSION = "0.11";
+export const VERSION = "0.12";
 
 const USAGE = `seedmi-dac: a reference delegated access control provider.
 Usage: node src/dacd.ts [flags]
@@ -134,11 +134,14 @@ function main(): void {
   const server: Server = createServer({ cert: config.tlsCert, key: config.tlsKey, minVersion: "TLSv1.2" } as never,
     (req, res) => {
       const url = new URL(req.url ?? "/", "https://provider");
-      if (url.pathname === "/health") {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "ok", version: VERSION }));
-        return;
-      }
+      // A health check stood here until 0.12 and is withdrawn. No standard
+      // defines one — not this draft, not CDMI, and the nearest thing,
+      // draft-inadarei-api-health-check, expired without becoming an RFC — and
+      // nothing outside this program's own tests ever called it. It answered
+      // anyone who reached the port with this provider's version, which is of
+      // use to nobody but someone matching it against a list of known defects.
+      // A provider that is up answers a decision; one that is not answers
+      // nothing, and that is the check worth making.
       // Every request that arrives for a decision is recorded here, before it
       // is read, so that one that is refused before it can be decided is
       // recorded too: a wrong path, a wrong method, a body too large, a body

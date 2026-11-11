@@ -26,12 +26,13 @@ import { createServer } from "node:https";
 import * as path from "node:path";
 import { applyFlags, checkComplete, type Config, ConfigError, DEFAULTS, parseConfig, readArgv } from "./config.ts";
 import { hashPassword } from "./dc-directory.ts";
+import { redirectBack, SCOPES, type AuthorizationRequest } from "./tokens.ts";
 import { createServer as createTlsServer, TLSSocket, type TLSServer, type TLSSocketType } from "node:tls";
 import type { Socket as NetSocket } from "node:net";
 import { baseOf, LdapSession } from "./ldap.ts";
 import { Throttle } from "./throttle.ts";
 
-export const VERSION = "1.4";
+export const VERSION = "1.12";
 const LIMIT = 64 * 1024;
 
 const USAGE = `seedmi-dc: a reference domain controller.
@@ -75,6 +76,49 @@ log apply from the next request, and a store is read again. A configuration that
 does not load leaves the one in use. The realm, its domain and where the
 directory is kept are what the instance is, and a reload changing them is refused.
 `;
+
+/**
+ * The origin of a validated redirect address, as a CSP source expression, for
+ * the sign-in form's `form-action`. A browser checks that directive against
+ * the redirects a submission produces, so the address the flow ends at has to
+ * be named there or the browser drops it. An address that will not parse
+ * yields `'none'`, which forbids rather than permits: this is only ever called
+ * with an address `beginAuthorization` has already accepted, and a value that
+ * cannot be read is not one to widen a policy with.
+ */
+function formTarget(redirectUri: string): string {
+  try { return new URL(redirectUri).origin; } catch { return "'none'"; }
+}
+
+/**
+ * The scopes this program defines, in words. A deployment names its own as
+ * well (`cdmi:read` and the rest belong to a CDMI server, not to this one), and
+ * those have no gloss here: a scope token is shown as it is rather than
+ * guessed at, because a wrong description of a permission is worse than none.
+ */
+const SCOPE_MEANS: Record<string, string> = {
+  [SCOPES.read]: "read this directory's users and groups",
+  [SCOPES.admin]: "change this directory's users and groups",
+};
+
+/**
+ * What the token will be able to do, and to what, for the sign-in page. Signing
+ * in is the consent, so the page has to say what is being consented to.
+ *
+ * A request naming no scope is the interesting case and is said plainly: this
+ * controller issues what was asked for and nothing more, so no scope means a
+ * token that opens nothing, and a person told "no particular permission" can
+ * tell that from a client that asked for everything.
+ */
+function consentBlock(asked: AuthorizationRequest, esc: (v: string) => string): string {
+  const scopes = asked.scopes.length === 0
+    ? `<p style="margin:.4rem 0 0">No particular permission, so the token will not by itself open anything.</p>`
+    : `<ul>${asked.scopes.map((s) => `<li><code>${esc(s)}</code>` +
+        (SCOPE_MEANS[s] === undefined ? "" : ` — ${esc(SCOPE_MEANS[s])}`) + `</li>`).join("")}</ul>`;
+  const where = asked.resources.length === 0 ? ""
+    : `<p class="where">At ${asked.resources.map((r) => esc(r)).join(", ")}</p>`;
+  return `<div class="asks">It is asking to be allowed to:${scopes}${where}</div>`;
+}
 
 function logger(c: Config): (level: "problems" | "requests", event: Record<string, unknown>) => void {
   if (c.log === "off") return () => undefined;
@@ -149,7 +193,7 @@ async function main(): Promise<void> {
   let keys: KeyStore | undefined;
   const fromStore = async (): Promise<void> => {
     if (store === undefined || keys === undefined) return;
-    const view = await readDirectory(store, keys);
+    const view = await readDirectory(store, keys, { realm: config.realm, domain: config.domain });
     // Kept for --sweep-keys, which reports the other direction from this rather than
     // looking for it: a reference whose material the key server will not hand over is
     // what these two lists are.
@@ -261,8 +305,59 @@ async function main(): Promise<void> {
   const server: Server = createServer({ cert: config.tlsCert, key: config.tlsKey, minVersion: "TLSv1.2" } as never,
     (req, res) => {
       const url = new URL(req.url ?? "/", "https://controller");
+
+      // Cross-origin resource sharing. A browser-based client — the desktop's
+      // MCP inspector, or any page that follows RFC 9728 to an authorization
+      // server — fetches this controller's metadata, its JWK Set and its token
+      // endpoint from another origin, this being a listener of its own. Every
+      // release before 1.6 emitted no Access-Control field at all, so the
+      // request was made, this controller answered it correctly, and the
+      // browser threw the answer away: the page saw a failure to fetch and the
+      // client reported it as a certificate it did not trust, which sent a
+      // reader to accept a certificate that was already accepted.
+      //
+      // seedmi met the same thing in its 0.92 and settled it there: validating
+      // the Origin field decides whether this server *answers*, and these
+      // fields decide whether the browser hands that answer *to the page*.
+      // Doing the first without the second refuses nothing and is readable by
+      // nobody. The rules below are that release's, which are the standard's.
+      const origin = req.headers.origin as string | undefined;
+      const permitted = origin !== undefined &&
+        (config.origins.includes("*") || config.origins.includes(origin));
+      // The specific origin is echoed and never a bare "*", so that a client
+      // making its requests in the credentials mode is not refused by the
+      // browser: the Fetch standard forbids a wildcard with credentials. Vary
+      // is named whether or not the origin is permitted, so that a cache
+      // cannot hand one origin's answer, or one origin's refusal, to another.
+      const cors: Record<string, string> = origin === undefined ? {}
+        : permitted
+          ? { "Access-Control-Allow-Origin": origin, "Access-Control-Allow-Credentials": "true",
+              "Access-Control-Expose-Headers": "WWW-Authenticate, Content-Type, ETag, Location", Vary: "Origin" }
+          : { Vary: "Origin" };
+
+      // The preflight, answered before anything is read or authenticated: a
+      // browser sends no credential on one, so requiring a credential here
+      // would refuse every cross-origin request before it was made.
+      if (req.method === "OPTIONS" && origin !== undefined) {
+        if (!permitted) {
+          res.writeHead(403, { ...cors, "Content-Type": "application/problem+json" });
+          res.end(JSON.stringify({ type: "about:blank", title: "This origin is not permitted.",
+            detail: "[listen].origins names the origins a browser may read this controller's answers from" }));
+          return;
+        }
+        res.writeHead(204, { ...cors,
+          "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
+          // Authorization is named rather than left to a wildcard: the Fetch
+          // standard excludes it from the wildcard, and every request this
+          // controller answers for a client carries one.
+          "Access-Control-Allow-Headers": "Authorization, Content-Type, If-Match, If-None-Match",
+          "Access-Control-Max-Age": "600" });
+        res.end();
+        return;
+      }
+
       const json = (status: number, body: unknown, headers: Record<string, string> = {}) => {
-        res.writeHead(status, { "Content-Type": "application/json", ...headers });
+        res.writeHead(status, { "Content-Type": "application/json", ...cors, ...headers });
         res.end(JSON.stringify(body));
       };
       // The token service (tokens.ts), where [tokens] is given.
@@ -271,8 +366,209 @@ async function main(): Promise<void> {
         return json(200, tokens.metadata());
       }
       if (tokens !== undefined && url.pathname === "/jwks" && req.method === "GET") return json(200, tokens.jwks());
+      // The authorization endpoint (RFC 6749 section 4.1), with the code
+      // challenge of RFC 7636. A person signs in here and the client is sent a
+      // code; the client proves at the token endpoint that it is the one that
+      // asked, by presenting the verifier whose hash it sent. That is what lets
+      // a program with no secret — a page in a browser, a desktop application —
+      // obtain a token for the person using it without ever holding the
+      // person's password or a credential of its own worth stealing.
+      //
+      // There is no session and no cookie. A GET that carries no credential
+      // answers the sign-in form, and the form posts the request's own
+      // parameters back as hidden fields together with the password, so the
+      // whole exchange is two requests and this controller remembers nothing
+      // about a browser between them. A session here would be one more thing to
+      // fix to the person, to expire, and to get wrong.
+      if (tokens !== undefined && url.pathname === "/authorize") {
+        if (req.method !== "GET" && req.method !== "POST") {
+          res.writeHead(405, { Allow: "GET, POST", ...cors }); res.end(); return;
+        }
+        const finish = (q: URLSearchParams, who?: { name: string; password: string }) => {
+          const begun = tokens!.beginAuthorization(q);
+          if (begun.kind === "refuse") {
+            // The client or its redirect address is in doubt, so the answer goes
+            // to the person and not to the address in question: RFC 6749 section
+            // 4.1.2.1. Redirecting here is how an authorization endpoint becomes
+            // a way to send somebody else's code wherever a request asks.
+            res.writeHead(400, { "Content-Type": "application/problem+json", ...cors });
+            res.end(JSON.stringify({ type: "about:blank", title: begun.title, detail: begun.detail }));
+            return;
+          }
+          if (begun.kind === "error") {
+            // iss on an error too: RFC 9207 section 2 has it in every
+            // authorization response, and a client that may reject an answer
+            // from the wrong server must be able to tell for a refusal as well
+            // — otherwise an attacker's error, with its own error_description,
+            // is displayed to the person as though it came from here.
+            res.writeHead(302, { Location: redirectBack(begun.redirectUri,
+              { error: begun.error, error_description: begun.description, state: begun.state,
+                iss: tokens!.issuer }), ...cors });
+            res.end();
+            return;
+          }
+          // How the person is authenticated here. RFC 6749 section 3.1 leaves
+          // this to the server — "username and password login, session
+          // cookies ... is beyond the scope" — so the endpoint takes what the
+          // caller already holds, and asks only where it holds nothing.
+          //
+          // A bearer token this controller issued, audienced at THIS
+          // CONTROLLER and not at a resource. That restriction is the whole of
+          // the safety: were any token of this realm accepted, a token issued
+          // for a resource — one the client already holds, narrow and for one
+          // endpoint — could be presented here to mint a code for a different
+          // client with different scopes, and a narrow token would be a lever
+          // for a broad one. A token whose audience is the authorization
+          // server is a token for the authorization server, which is this
+          // server as its own resource server (RFC 9068 section 2.2), and a
+          // client may ask for that audience only where its registration says
+          // so. Unlike a session cookie, a browser attaches none of this by
+          // itself, so there is nothing here to be made to do cross-site.
+          const presented = String(req.headers.authorization ?? "");
+          let signedIn: { name: string } | undefined;
+          if (/^Bearer /i.test(presented) && tokens !== undefined) {
+            const claims = tokens.verify(presented.replace(/^Bearer /i, ""), Date.now(), config.tokens!.issuer);
+            const sub = claims === undefined ? undefined : claims.sub;
+            if (typeof sub === "string" && !sub.includes("@") && config.directory.user(sub) !== undefined) {
+              signedIn = { name: sub };
+            } else {
+              log("problems", { event: "authorization refused", client: begun.client.id,
+                reason: claims === undefined ? "the token is not one this controller issued for itself" : "the token names no user of this directory" });
+              res.writeHead(401, { "WWW-Authenticate": `Bearer realm="${config.realm}", error="invalid_token"`,
+                "Content-Type": "application/problem+json", ...cors });
+              res.end(JSON.stringify({ type: "about:blank", title: "That token does not sign anyone in here.",
+                detail: "A token presented at the authorization endpoint is one this controller issued with " +
+                  "itself as the audience. A token for a resource is not one." }));
+              return;
+            }
+          } else if (/^Basic /i.test(presented)) {
+            // The credential the caller already holds, which is what a desktop
+            // that signed a person in has. It saves the form and nothing else:
+            // the password reaches this controller either way.
+            let decoded = "";
+            try { decoded = Buffer.from(presented.replace(/^Basic /i, ""), "base64").toString("utf8"); } catch { decoded = ""; }
+            const cut = decoded.indexOf(":");
+            if (cut > 0) who = { name: decoded.slice(0, cut), password: decoded.slice(cut + 1) };
+          }
+          if (signedIn === undefined && who === undefined) { signIn(q, undefined, begun); return; }
+          // Guessing. This endpoint verifies the same password the password
+          // grant and an LDAP bind verify, and until 1.11 it was the only one of
+          // the three outside the throttle: ten wrong passwords here were ten
+          // passwords checked, none recorded, and the eleventh attempt with the
+          // right one was accepted — while the same ten at the token endpoint
+          // locked the name. Throttle's own comment states the intent, that
+          // "LDAP binds verify the same passwords, and are throttled by the same
+          // record"; this is the third door and now shares it.
+          //
+          // A locked name is refused exactly as a wrong password is, which is
+          // this program's existing convention (see throttle.ts) and means the
+          // page says nothing about whether the name exists or is locked.
+          const guessing = signedIn === undefined && who !== undefined;
+          if (guessing && throttle.locked("user", who!.name)) {
+            log("problems", { event: "authorization refused", user: who!.name, client: begun.client.id, reason: "locked" });
+            signIn(q, "That is not a name and password of this realm.", begun);
+            return;
+          }
+          const verdict = signedIn !== undefined ? { ok: true as const, user: { name: signedIn.name } }
+            : config.directory.verify(who!.name, who!.password);
+          if (guessing) {
+            // "disabled" and "expired" are not wrong passwords, and a name is
+            // not locked for them: the same judgement the password grant makes.
+            throttle.record("user", who!.name, verdict.ok ||
+              (verdict as { reason: string }).reason === "disabled" ||
+              (verdict as { reason: string }).reason === "expired");
+          }
+          if (!verdict.ok) {
+            log("problems", { event: "authorization refused", user: who!.name, client: begun.client.id, reason: (verdict as { reason: string }).reason });
+            signIn(q, "That is not a name and password of this realm.", begun);
+            return;
+          }
+          const code = tokens!.issueCode(begun, { name: verdict.user.name, groups: config.directory.groupsOf(verdict.user.name) });
+          log("requests", { event: "code issued", user: verdict.user.name, client: begun.client.id, aud: begun.resources.join(" ") });
+          res.writeHead(302, { Location: redirectBack(begun.redirectUri,
+            { code, state: begun.state, iss: tokens!.issuer }),
+            "Cache-Control": "no-store", ...cors });
+          res.end();
+        };
+        // The form. It carries the request's own parameters so that nothing is
+        // held here between the two requests, and nothing of the request is
+        // taken from anywhere but the address the person arrived at.
+        const signIn = (q: URLSearchParams, wrong: string | undefined, asked: AuthorizationRequest) => {
+          const redirectUri = asked.redirectUri;
+          const esc = (v: string) => v.replace(/[&<>"']/g, (c) =>
+            ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
+          const hidden = [...q.entries()].filter(([k]) => k !== "username" && k !== "password")
+            .map(([k, v]) => `<input type="hidden" name="${esc(k)}" value="${esc(v)}">`).join("");
+          res.writeHead(wrong === undefined ? 200 : 401,
+            { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store",
+              // The form posts to this origin and nothing embeds it: a sign-in
+              // page in a frame is a sign-in page somebody else is reading.
+              //
+              // form-action names the client's redirect origin as well as this
+              // one, because a browser checks the directive against the
+              // REDIRECTS a submission produces and not only against the
+              // address the form names. `form-action 'self'` alone therefore
+              // forbids the 302 that completes the flow — the one redirect the
+              // whole exchange exists to perform — and the page posts, the code
+              // is issued, and the browser silently drops the answer. Nothing
+              // here caught it: curl followed the redirect, and no test runs a
+              // browser, so a header only a browser enforces is a header only a
+              // browser can refute. The origin is taken from the redirect
+              // address this request already validated, so naming it grants
+              // nothing that was not already granted.
+              "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; " +
+                `form-action 'self' ${formTarget(redirectUri)}; frame-ancestors 'none'`,
+              "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer", ...cors });
+          res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8">` +
+            `<meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in</title>` +
+            `<style>body{font:16px/1.5 system-ui,sans-serif;margin:0;display:grid;place-items:center;min-height:100vh;background:#f6f7f9;color:#14181f}` +
+            `form{background:#fff;padding:2rem;border-radius:12px;box-shadow:0 1px 3px #0002;width:min(22rem,92vw)}` +
+            `h1{font-size:1.1rem;margin:0 0 .25rem}p{margin:0 0 1.25rem;color:#5b6472;font-size:.9rem}` +
+            `label{display:block;font-size:.85rem;margin:.75rem 0 .25rem}` +
+            `input[type=text],input[type=password]{width:100%;padding:.55rem;border:1px solid #c9ced6;border-radius:6px;font:inherit;box-sizing:border-box}` +
+            `button{margin-top:1.25rem;width:100%;padding:.6rem;border:0;border-radius:6px;background:#14181f;color:#fff;font:inherit;cursor:pointer}` +
+            `.no{color:#a3121f;font-size:.85rem;margin:.75rem 0 0}` +
+            `.asks{margin:0 0 1.25rem;padding:.75rem .9rem;background:#f6f7f9;border-radius:8px;font-size:.85rem;color:#14181f}` +
+            `.asks ul{margin:.4rem 0 0;padding-left:1.1rem}.asks li{margin:.15rem 0}` +
+            `.asks code{font:inherit;font-family:ui-monospace,monospace}` +
+            `.asks .where{margin:.5rem 0 0;color:#5b6472;font-size:.8rem}</style></head><body>` +
+            `<form method="post" action="/authorize"><h1>Sign in to ${esc(config.realm)}</h1>` +
+            `<p>${esc(asked.client.id)} is asking for a token in your name.</p>${hidden}` +
+            // What the token will be able to do, and to what. Signing in IS the
+            // consent here — there is no second page — and consent to something
+            // unnamed is not consent. A public client cannot be authenticated
+            // at all (its id is not a secret; only its registered redirect
+            // address ties the request to the real program), so what the person
+            // is told is the whole of the control. Until 1.11 the page named the
+            // client and neither the scopes nor the resource, which meant
+            // nobody could decline `cdmi:admin` because nobody was shown it.
+            //
+            // Taken from the validated request and not from the query, so that
+            // what is displayed is what will be issued.
+            consentBlock(asked, esc) +
+            `<label for="u">Name</label><input id="u" name="username" type="text" autocomplete="username" autofocus required>` +
+            `<label for="p">Password</label><input id="p" name="password" type="password" autocomplete="current-password" required>` +
+            (wrong === undefined ? "" : `<p class="no">${esc(wrong)}</p>`) +
+            `<button type="submit">Sign in</button></form></body></html>`);
+        };
+        if (req.method === "GET") { finish(url.searchParams); return; }
+        const chunks: Buffer[] = [];
+        let size = 0;
+        req.on("data", (d: Buffer) => {
+          size += d.length;
+          if (size > 64 * 1024) { res.writeHead(413, cors); res.end(); req.destroy(); return; }
+          chunks.push(d);
+        });
+        req.on("end", () => {
+          const posted = new URLSearchParams(Buffer.concat(chunks).toString("utf8"));
+          const name = posted.get("username") ?? "", password = posted.get("password") ?? "";
+          if (name === "" || password === "") { finish(posted); return; }
+          finish(posted, { name, password });
+        });
+        return;
+      }
       if (tokens !== undefined && url.pathname === "/token") {
-        if (req.method !== "POST") { res.writeHead(405, { Allow: "POST" }); res.end(); return; }
+        if (req.method !== "POST") { res.writeHead(405, { Allow: "POST", ...cors }); res.end(); return; }
         const type = String(req.headers["content-type"] ?? "").split(";")[0].trim().toLowerCase();
         if (type !== "application/x-www-form-urlencoded") {
           return json(400, { error: "invalid_request", error_description: "the request is application/x-www-form-urlencoded" },
@@ -284,7 +580,7 @@ async function main(): Promise<void> {
         req.on("end", async () => {
           const out = await tokens.token(req.headers.authorization as string | undefined, Buffer.concat(chunks).toString("utf8"));
           log(out.status === 200 ? "requests" : "problems", out.log);
-          res.writeHead(out.status, out.headers);
+          res.writeHead(out.status, { ...out.headers, ...cors });
           res.end(JSON.stringify(out.body));
         });
         return;
@@ -312,20 +608,49 @@ async function main(): Promise<void> {
             ...(chunks.length === 0 ? {} : { body: Buffer.concat(chunks).toString("utf8") }),
           });
           if (out.log !== undefined) log(out.status < 400 ? "requests" : "problems", out.log);
-          res.writeHead(out.status, out.headers ?? {});
+          res.writeHead(out.status, { ...(out.headers ?? {}), ...cors });
           // A 204 and a 304 carry no body, as HTTP requires.
           res.end(out.body === undefined ? undefined : JSON.stringify(out.body));
         });
         return;
       }
-      if (url.pathname === "/health" && (req.method === "GET" || req.method === "HEAD")) {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "ok", version: VERSION, realm: config.realm, domain: config.domain,
-          users: config.directory.userNames().length, groups: config.directory.groupList().length }));
-        return;
-      }
-      res.writeHead(404);
-      res.end();
+      // A health check stood here until 1.7 and is withdrawn. No standard
+      // defines one: not CDMI, which does not mention health at all, and not
+      // the nearest thing to a specification for it,
+      // draft-inadarei-api-health-check, which expired without becoming an RFC
+      // and whose vocabulary this answer did not use in any case. It was this
+      // program's own plan that asked for it, nothing outside this tree's
+      // tests ever called it, and it told anyone who reached the port the
+      // version, the realm, the DNS domain and the size of the directory —
+      // an inventory published nowhere else and of use to nobody but someone
+      // matching a version against a list of known defects.
+      //
+      // What it was used for here was observing a reload. The tests observe
+      // that through LDAP now, which is the front end this directory is
+      // actually served by, and the announcement at startup names the realm
+      // and both ports for an operator.
+      // A path this controller does not serve, answered as a problem details
+      // document (RFC 9457) rather than as an empty body. It was empty until
+      // 1.6, and the one occasion a person types the root URL into a browser
+      // is the one this setup asks of them — accepting a self-signed
+      // certificate, or checking the controller is up — where a blank page
+      // confirms neither that they reached this server nor that anything is
+      // wrong. It names the paths it serves and not its version: those paths
+      // are published already by the metadata document, which RFC 8414 makes
+      // public, and a version is of use to nobody but someone matching it
+      // against a list of known defects.
+      res.writeHead(404, { "Content-Type": "application/problem+json", ...cors });
+      res.end(JSON.stringify({
+        type: "about:blank",
+        title: "This controller serves no such path.",
+        detail: "It is a domain controller, not a web site. Over HTTPS it serves " +
+          (config.tokens === undefined
+            ? "its SCIM front end at /scim/v2/; [tokens] is not configured, so it is no authorization server and serves no token endpoint."
+            : "the authorization server metadata of RFC 8414 at /.well-known/oauth-authorization-server, " +
+              "its JWK Set at /jwks, its token endpoint at /token, and its SCIM front end at /scim/v2/.") +
+          " Its directory is reached over LDAP, on a port of its own.",
+        instance: url.pathname,
+      }));
     });
 
   // SIGHUP: the configuration read again, and the directory rebuilt from it.
@@ -512,8 +837,49 @@ async function main(): Promise<void> {
 
   server.listen(config.port, config.host, () => {
     const at = server.address() as { port: number };
-    const announce = (ldapAt?: number) => process.stdout.write(`seedmi-dc ${VERSION}: realm ${config.realm} (${config.domain}) ` +
-      `at https://${config.host}:${at.port}/` + (ldapAt === undefined ? "" : ` and ldaps://${config.host}:${ldapAt}/${baseOf(config.domain)}`) + "\n");
+    const announce = (ldapAt?: number) => {
+      process.stdout.write(`seedmi-dc ${VERSION}: realm ${config.realm} (${config.domain}) ` +
+        `at https://${config.host}:${at.port}/` + (ldapAt === undefined ? "" : ` and ldaps://${config.host}:${ldapAt}/${baseOf(config.domain)}`) + "\n");
+      // An authorization server no browser-based client can use, said at
+      // startup rather than left to be discovered. Where [tokens] is given
+      // this controller is the authorization server of its realm, and a client
+      // that follows RFC 9728 to it from a page fetches its metadata, its JWK
+      // Set and its token endpoint across origins — which the browser permits
+      // only where this controller names that origin. Naming none is a
+      // deployment whose clients are not browsers, which is a reasonable thing
+      // to be; it is not a reasonable thing to be by accident, and 1.7 was
+      // started with a configuration written before [listen].origins existed
+      // and said nothing at all. The TLS warning beside this one set the
+      // precedent: a server that knows it cannot serve some client says so.
+      if (config.tokens !== undefined && config.origins.length === 0) {
+        process.stdout.write("seedmi-dc: [listen].origins names no origin, so no browser-based client can read " +
+          "this authorization server's metadata, its JWK Set or its token endpoint: the browser discards an " +
+          "answer no Access-Control-Allow-Origin permits it to read. Name the origins a page reaches this " +
+          "controller from, or \"*\".\n");
+      }
+      // The password grant is withdrawn. RFC 9700 section 2.4 — BCP 240, the
+      // current best practice — is unconditional: "The resource owner password
+      // credentials grant MUST NOT be used", because it "insecurely exposes the
+      // credentials of the resource owner to the client", trains people "to
+      // enter their credentials in places other than the authorization server",
+      // and "is not designed to work with two-factor authentication". OAuth 2.1
+      // removes it, and the MCP authorization specification requires an
+      // authorization server to implement OAuth 2.1.
+      //
+      // It is still served, because withdrawing a grant a deployment is using
+      // between one version and the next breaks that deployment without
+      // warning. This IS the warning. There was nothing to move to before 1.9;
+      // now there is, which is what makes the removal a plan rather than a wish.
+      const onPassword = config.tokens?.onPasswordGrant ?? [];
+      if (onPassword.length > 0) {
+        process.stdout.write(`seedmi-dc: ${onPassword.join(", ")} ` +
+          `${onPassword.length === 1 ? "is registered" : "are registered"} for the password grant, which RFC 9700 ` +
+          "section 2.4 says MUST NOT be used and OAuth 2.1 removes: it gives the client the person's password. " +
+          "Use the authorization code flow with PKCE instead — register the client with no secret, " +
+          "grants = [\"authorization_code\"] and its redirect_uris. This grant will be removed in a later " +
+          "version of seedmi-dc.\n");
+      }
+    };
     const withKdc = (ldapAt?: number) => {
       const then = () => {
         announce(ldapAt);

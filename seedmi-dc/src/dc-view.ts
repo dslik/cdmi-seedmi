@@ -69,7 +69,8 @@ export function pathsOf(units: Ou[]): Map<string, string> {
  * each credential that has a reference; a key store that refuses or cannot be
  * reached leaves the directory whole and the material out of it.
  */
-export async function readDirectory(store: Store, keys: KeyStore): Promise<View> {
+export async function readDirectory(store: Store, keys: KeyStore,
+  names: { realm?: string; domain?: string } = {}): Promise<View> {
   const paths = pathsOf(store.units());
   const principals = store.principals();
   const byId = new Map(principals.map((p) => [p.id, p]));
@@ -187,7 +188,7 @@ export async function readDirectory(store: Store, keys: KeyStore): Promise<View>
   }));
   let directory: Directory;
   try {
-    directory = new Directory(users, groups, unitSpecs);
+    directory = new Directory(users, groups, unitSpecs, names);
   } catch (e) {
     if (e instanceof DirectoryError) {
       throw new DirectoryError(`the store does not read as a directory: ${e.message}`);

@@ -651,8 +651,19 @@ if (config.users.length > 0 && config.domainControllers.length > 0) {
   }
 }
 if (config.domainControllers.length > 0) {
+  // A token resolved at a domain controller names this server by any of the
+  // identifiers it answers to, exactly as one [oauth] verifies does: the
+  // identifier the table states, and every other resource identifier of this
+  // one server. `audiences` above is that set, and is the one place the
+  // judgement is made. Until 0.129 this path matched the stated value alone,
+  // so a token obtained for the MCP endpoint was accepted at the transport and
+  // refused at the operation.
+  const answeringFor = (stated: string | string[] | undefined): string[] | undefined =>
+    stated === undefined ? undefined
+      : [...new Set([...(Array.isArray(stated) ? stated : [stated]), ...audiences])];
   binding.domainControllers = new DomainControllers(config.domainControllers.map((c) =>
-    new DomainController(c, (groups) => binding.directory.privilegesOf(c.domain, groups))));
+    new DomainController({ ...c, audience: answeringFor(c.audience) },
+      (groups) => binding.directory.privilegesOf(c.domain, groups))));
   // The controller NFS resolves its sys credentials at, where there is one to choose
   // without choosing. See the note at the NFS server above.
   const all = binding.domainControllers.all();

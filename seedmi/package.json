@@ -1,1 +1,9 @@
-{"name":"seedmi","version":"0.128.0","private":true,"type":"module"}
+{
+  "name": "seedmi",
+  "version": "0.134.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test \"src/*.test.ts\""
+  }
+}

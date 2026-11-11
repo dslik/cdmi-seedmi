@@ -33,7 +33,7 @@ import { type KeyStore, WriteError, Writer } from "./dc-write.ts";
 import { KmipKeyStore } from "./dc-keys.ts";
 import { ETYPE } from "./krb-crypto.ts";
 
-export const VERSION = "1.4";
+export const VERSION = "1.12";
 
 const USAGE = `dc-import: seeds a seedmi-dc store from a bootstrap file.
 Usage: node src/dc-import.ts --config <path> --from <path> [flags]

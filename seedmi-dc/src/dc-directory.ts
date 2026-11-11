@@ -246,8 +246,19 @@ export class Directory {
   private readonly unitPaths: string[] = [];
   /** How many users were given a plain password, which the log warns of. */
   readonly plainPasswords: number;
+  /**
+   * The suffixes a principal of this directory may be named with, in lower
+   * case and without the commercial at: the Kerberos realm and the realm's DNS
+   * domain. Empty where the caller states neither, and a name is then the bare
+   * name alone, as it was before 1.5.
+   */
+  private readonly suffixes: string[] = [];
 
-  constructor(users: UserSpec[], groups: GroupSpec[], units: UnitSpec[] = []) {
+  constructor(users: UserSpec[], groups: GroupSpec[], units: UnitSpec[] = [],
+    names: { realm?: string; domain?: string } = {}) {
+    for (const s of [names.realm, names.domain]) {
+      if (s !== undefined && s !== "") this.suffixes.push(s.toLowerCase());
+    }
     for (const u of units) {
       this.unitHeld.set(u.path, u);
       this.unitPaths.push(u.path);
@@ -581,12 +592,37 @@ export class Directory {
    * expired account is refused after its password is checked, for the same reason.
    */
   verify(name: string, password: string, now = new Date()): Verdict {
-    const u = this.users.get(name.toLowerCase());
+    const u = this.named(name);
     const matches = checkPassword(password, u?.hash ?? ABSENT);
     if (u === undefined) return { ok: false, reason: "unknown" };
     if (!matches) return { ok: false, reason: "password" };
     if (u.disabled) return { ok: false, reason: "disabled" };
     if (u.expires !== undefined && u.expires <= now) return { ok: false, reason: "expired" };
     return { ok: true, user: this.user(u.name)! };
+  }
+
+  /**
+   * The user a name denotes: the name as given, or, where it carries this
+   * realm or the realm's DNS domain as a suffix, the name before that suffix.
+   *
+   * A principal is resolved to its realm-qualified form everywhere else here,
+   * and `ldap.ts` already accepts the qualified form where it asserts an
+   * identity (`:1584`, `wanted === principal.split("@")[0]`). The password
+   * grant did not, so a client that signed a person in as `alice@example.com`
+   * — the one form it holds — was answered `invalid_grant`, "the resource
+   * owner's credentials are not accepted", which reads as a wrong password and
+   * is not one. The suffix is checked against this directory's own names, so
+   * `alice@somewhere.else` is still unknown rather than silently stripped.
+   *
+   * Called before the password is compared, so a name that is not here still
+   * has a hash compared all the same and the time taken tells nothing.
+   */
+  private named(name: string): HeldUser | undefined {
+    const lower = name.toLowerCase();
+    const direct = this.users.get(lower);
+    if (direct !== undefined) return direct;
+    const at = lower.lastIndexOf("@");
+    if (at <= 0 || !this.suffixes.includes(lower.slice(at + 1))) return undefined;
+    return this.users.get(lower.slice(0, at));
   }
 }

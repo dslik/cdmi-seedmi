@@ -26,7 +26,7 @@ import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import { parseTOML, type TOMLValue } from "./toml.ts";
 import { Directory, DirectoryError, type GroupSpec, HASH, hashPassword, type UserSpec } from "./dc-directory.ts";
-import { type ClientSpec, GRANTS, SCOPES, TokenService, type TrustedRealm } from "./tokens.ts";
+import { type ClientSpec, GRANT, GRANTS, SCOPES, TokenService, type TrustedRealm } from "./tokens.ts";
 import { Throttle } from "./throttle.ts";
 import { formatDn, parseDn } from "./dn.ts";
 import type { KmsConfig } from "./dc-keys.ts";
@@ -56,6 +56,14 @@ export interface Config {
   domainSid: string;
   host: string;
   port: number;
+  /**
+   * The origins a browser-based client may read this controller's answers
+   * from, as `[listen].origins`: each an absolute origin, or "*" for any.
+   * Empty where none is configured, and a cross-origin page then reads
+   * nothing — which is what every release before 1.6 did, there being no
+   * such setting.
+   */
+  origins: string[];
   /** Where LDAP is served over TLS, or undefined where it is not. */
   ldapPort?: number;
   /**
@@ -112,7 +120,7 @@ export interface Config {
 }
 
 export const DEFAULTS: Config = {
-  realm: "", domain: "", host: "127.0.0.1", port: 8636, tlsCert: "", tlsKey: "", directory: new Directory([], []), plainSecrets: 0,
+  realm: "", domain: "", host: "127.0.0.1", port: 8636, origins: [], tlsCert: "", tlsKey: "", directory: new Directory([], []), plainSecrets: 0,
   directMemberOf: false,
   domainSid: "",
   log: "off", logFormat: "text",
@@ -222,7 +230,24 @@ export function parseConfig(text: string, dir = ".", throttle: Throttle = new Th
 
   const listen = table(doc.listen, "[listen]");
   only(listen, "[listen]", ["host", "port", "ldap_port", "ldap_starttls_port",
-    "certificate", "certificate_file", "key", "key_file"]);
+    "certificate", "certificate_file", "key", "key_file", "origins"]);
+  // Which browser origins may read what this controller answers. A metadata
+  // document and a JWK Set are public documents and the token endpoint is
+  // guarded by a client credential rather than by who may read the answer, so
+  // "*" is a reasonable setting for a deployment whose clients are browsers.
+  const origins = strings(listen, "origins", "[listen]");
+  if (origins !== undefined) {
+    for (const o of origins) {
+      if (o === "*") continue;
+      let u: URL | undefined;
+      try { u = new URL(o); } catch { u = undefined; }
+      if (u === undefined || `${u.protocol}//${u.host}` !== o) {
+        throw new ConfigError(`[listen].origins holds an origin such as "https://desktop.example:9443", or "*"; ` +
+          `${JSON.stringify(o)} is neither`);
+      }
+    }
+    c.origins = origins;
+  }
   const ldapPort = int(listen, "ldap_port", "[listen]");
   if (ldapPort !== undefined) c.ldapPort = ldapPort;
   const startTlsPort = int(listen, "ldap_starttls_port", "[listen]");
@@ -400,7 +425,7 @@ export function parseConfig(text: string, dir = ".", throttle: Throttle = new Th
     return { name, groups: strings(t, "groups", where) };
   });
   try {
-    c.directory = new Directory(users, groups);
+    c.directory = new Directory(users, groups, [], { realm: c.realm, domain: c.domain });
   } catch (e) {
     if (e instanceof DirectoryError) throw new ConfigError(e.message);
     throw e;
@@ -443,7 +468,7 @@ export function parseConfig(text: string, dir = ".", throttle: Throttle = new Th
     const ids = new Set<string>();
     const clients: ClientSpec[] = clientTables.map((t, i) => {
       const where = `[[client]][${i}]`;
-      only(t, where, ["id", "secret_hash", "secret", "grants", "audiences", "subject_audiences", "scopes"]);
+      only(t, where, ["id", "secret_hash", "secret", "grants", "audiences", "subject_audiences", "scopes", "redirect_uris"]);
       const id = str(t, "id", where);
       if (id === undefined || id === "") throw new ConfigError(`${where} gives an id`);
       if (ids.has(id)) throw new ConfigError(`the client ${id} is given twice`);
@@ -456,14 +481,64 @@ export function parseConfig(text: string, dir = ".", throttle: Throttle = new Th
         throw new ConfigError(`the client ${id} has the name of the user ${asUser.name}, whose tokens its own would be mistaken for`);
       }
       const hash = str(t, "secret_hash", where), secret = str(t, "secret", where);
-      if ((hash === undefined) === (secret === undefined || secret === "")) {
+      if (hash !== undefined && secret !== undefined && secret !== "") {
         throw new ConfigError(`${where} gives a secret_hash (as --hash-password prints), or a secret; one`);
       }
       if (hash !== undefined && !HASH.test(hash)) throw new ConfigError(`${where}.secret_hash is not one --hash-password writes`);
       if (secret !== undefined) plain++;
+      // A client that gives neither is public: it holds no secret and proves
+      // nothing, which is what a program delivered to a browser or to a desktop
+      // is. It authenticates by naming itself (RFC 6749 section 4.3.2) and is
+      // held to the code flow, where PKCE binds the code to the request that
+      // asked for it; a secret shipped inside such a program is read by anyone
+      // who has the program, which is why OAuth 2.1 and RFC 8252 give it none.
+      const publicClient = hash === undefined && (secret === undefined || secret === "");
       const grants = strings(t, "grants", where);
       if (grants.length === 0) throw new ConfigError(`${where} gives the grants it may use: ${GRANTS.join(", ")}`);
       for (const g of grants) if (!GRANTS.includes(g)) throw new ConfigError(`${where}.grants names ${g}; the grants are ${GRANTS.join(", ")}`);
+      // What a public client may not do. client_credentials is a client proving
+      // who it is and asking for a token of its own; a client that holds no
+      // secret proves nothing, so the grant would issue that token to whoever
+      // asked. The password grant is refused it for the same reason it is
+      // discouraged everywhere: a program that collects a person's password is
+      // the thing the code flow exists to avoid, and a public one cannot even
+      // be held to account for it afterwards.
+      if (publicClient) {
+        for (const g of [GRANT.clientCredentials, GRANT.password, GRANT.tokenExchange] as string[]) {
+          if (grants.includes(g)) {
+            throw new ConfigError(`${where} gives no secret, so it is a public client and may not use ${g}: ` +
+              `a client that holds no secret proves nothing. Give it ${GRANT.authorizationCode}, where the proof ` +
+              `is the code verifier, or give it a secret.`);
+          }
+        }
+      }
+      // Where a client may use the code flow, the addresses the authorization
+      // endpoint will send a code to, matched exactly. Exact matching is what
+      // keeps the endpoint from being an open redirector: a prefix or a
+      // wildcard is a way to send somebody else's code somewhere else.
+      const redirectUris = strings(t, "redirect_uris", where);
+      if (grants.includes(GRANT.authorizationCode) && redirectUris.length === 0) {
+        throw new ConfigError(`${where} may use ${GRANT.authorizationCode}, so it gives the redirect_uris ` +
+          `the authorization endpoint may send a code to`);
+      }
+      for (const u of redirectUris) {
+        let parsed: URL | undefined;
+        try { parsed = new URL(u); } catch { parsed = undefined; }
+        if (parsed === undefined || parsed.hash !== "" || u !== parsed.href.replace(/\/$/, parsed.pathname === "/" && !u.endsWith("/") ? "" : "/")) {
+          if (parsed === undefined || parsed.hash !== "") {
+            throw new ConfigError(`${where}.redirect_uris holds an absolute URI with no fragment; ` +
+              `${JSON.stringify(u)} is not one`);
+          }
+        }
+        // A redirect to a page is over TLS, save on the loopback interface,
+        // where RFC 8252 section 7.3 has a native program listen on a port it
+        // cannot choose in advance and http is the only scheme available.
+        const loopback = parsed.hostname === "127.0.0.1" || parsed.hostname === "[::1]" || parsed.hostname === "::1";
+        if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback)) {
+          throw new ConfigError(`${where}.redirect_uris holds ${JSON.stringify(u)}: a redirect is over https, ` +
+            `or over http to the loopback address, which RFC 8252 section 7.3 reserves for a program on this machine`);
+        }
+      }
       const audiences = strings(t, "audiences", where);
       if (audiences.length === 0) throw new ConfigError(`${where} gives the audiences it may ask a token for`);
       const subjectAudiences = t.subject_audiences === undefined ? undefined : strings(t, "subject_audiences", where);
@@ -480,7 +555,8 @@ export function parseConfig(text: string, dir = ".", throttle: Throttle = new Th
             `interface are ${Object.values(SCOPES).join(" and ")}`);
         }
       }
-      return { id, secretHash: hash ?? hashPassword(secret!), grants, audiences,
+      return { id, ...(publicClient ? {} : { secretHash: hash ?? hashPassword(secret!) }), grants, audiences,
+        ...(redirectUris.length === 0 ? {} : { redirectUris }),
         ...(subjectAudiences === undefined ? {} : { subjectAudiences }),
         ...(scopes.length === 0 ? {} : { scopes }) };
     });
