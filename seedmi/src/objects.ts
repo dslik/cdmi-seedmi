@@ -16,6 +16,7 @@ import { ATTR_DIRECTORY, ATTR_VOLUME_ID, type DirEntry, type FAT } from "./fat.t
 import { MT_CONTAINER, type RemoteRep, type RemoteSource } from "./remote.ts";
 import type { FileSource, NfsEntry } from "./nfs-import.ts";
 import { NF4DIR } from "./nfs.ts";
+import { HDF5, HDF5Error, type Element } from "./hdf5.ts";
 
 /**
  * A container object: one the store holds, a directory of an imported
@@ -27,16 +28,32 @@ export type DirRef =
   | { kind: "remote"; src: RemoteSource; path: string; rep?: RemoteRep }
   // An imported file system namespace: NFS or SMB, both of which
   // present names, sizes and times and no object identifier.
-  | { kind: "fs"; src: FileSource; path: string; entry?: NfsEntry };
+  | { kind: "fs"; src: FileSource; path: string; entry?: NfsEntry }
+  // A format image whose namespace is a graph of objects rather than a
+  // tree of directories, addressed by the path it is presented under.
+  | { kind: "hdf5"; h5: HDF5; path: string; element?: Element };
 
 /** Any object, held by any of the three. */
 export type ObjRef =
   | { kind: "store"; node: Node }
   | { kind: "image"; fs: FAT; dir: number; entry: DirEntry }
   | { kind: "remote"; src: RemoteSource; path: string; rep: RemoteRep }
-  | { kind: "fs"; src: FileSource; path: string; entry: NfsEntry };
+  | { kind: "fs"; src: FileSource; path: string; entry: NfsEntry }
+  | { kind: "hdf5"; h5: HDF5; path: string; element: Element };
 
-export const isImage = (r: DirRef | ObjRef): boolean => r.kind === "image";
+/**
+ * Whether the object is presented through an image import: it has no object
+ * ID, since an image holds no identifier stable for the lifetime of an
+ * object; its metadata is limited to what the format provides; and the
+ * importing container's access control list governs it.
+ *
+ * Both image formats answer to this, so a rule written for one holds for the
+ * other. Asking which format it is, where that matters, is a separate
+ * question from asking whether it is an image at all, and the two were one
+ * test until a second format arrived.
+ */
+export const isImage = (r: DirRef | ObjRef): boolean =>
+  r.kind === "image" || r.kind === "hdf5";
 
 /** The object a container reference names, as an object reference. */
 export function refOfDir(d: DirRef): ObjRef {
@@ -44,6 +61,7 @@ export function refOfDir(d: DirRef): ObjRef {
     case "store": return { kind: "store", node: d.node };
     case "image": return { kind: "image", fs: d.fs, dir: d.cluster, entry: d.entry! };
     case "remote": return { kind: "remote", src: d.src, path: d.path, rep: d.rep! };
+    case "hdf5": return { kind: "hdf5", h5: d.h5, path: d.path, element: d.element! };
     default: return { kind: "fs", src: d.src, path: d.path, entry: d.entry! };
   }
 }
@@ -64,6 +82,9 @@ export function sameRef(a: ObjRef, b: ObjRef): boolean {
   }
   if (a.kind === "fs" && b.kind === "fs") {
     return a.src === b.src && a.path === b.path;
+  }
+  if (a.kind === "hdf5" && b.kind === "hdf5") {
+    return a.h5 === b.h5 && a.path === b.path;
   }
   return false;
 }
@@ -136,6 +157,7 @@ export function viewOf(store: Store, ref: ObjRef): ObjectView {
   }
   if (ref.kind === "remote") return viewOfRemote(ref.rep);
   if (ref.kind === "fs") return viewOfNfs(ref.entry);
+  if (ref.kind === "hdf5") return viewOfHDF5(ref);
   const e = ref.entry;
   return {
     isContainer: (e.attr & ATTR_DIRECTORY) !== 0,
@@ -150,6 +172,61 @@ export function viewOf(store: Store, ref: ObjRef): ObjectView {
     // names identities that are not principals of this CDMI server.
     version: e.mtime.getTime() + e.size,
   };
+}
+
+/**
+ * The fields of an object an HDF5 import presents. A group becomes a
+ * container object and a dataset a data object; neither has an object ID,
+ * an owner or a list of its own, for the reasons every image object has
+ * none.
+ *
+ * The size of a data object is the size of the dataset's value, which the
+ * shape and the datatype give, and which is therefore known whether or not
+ * the value can be read: a dataset held in chunks or passed through the
+ * filter pipeline reports its true size and refuses its value, rather than
+ * reporting a size of zero and appearing to be empty.
+ */
+function viewOfHDF5(ref: { h5: HDF5; path: string; element: Element }): ObjectView {
+  const { h5, element } = ref;
+  const isContainer = element.presents === "container";
+  const address = element.object?.address;
+  let size = 0;
+  if (!isContainer && address !== undefined) {
+    try {
+      size = h5.dataset(address).size;
+    } catch {
+      // A dataset whose shape or datatype cannot be read has no size this
+      // can state; it is reported as zero rather than guessed at, and
+      // reading its value says why.
+      size = 0;
+    }
+  }
+  const mtime = address === undefined ? undefined : safely(() => h5.modified(address));
+  // The attributes of the object, which ECO-120B carries as user metadata.
+  // Those whose type does not carry over into a metadata item, and any whose
+  // name begins "cdmi_", are left out; hdf5.ts records why.
+  const userMetadata = address === undefined
+    ? {}
+    : safely(() => h5.attributes(address)) ?? {};
+  return {
+    isContainer,
+    // No object ID: the draft requires the field to be absent.
+    size,
+    // The format records no media type for a dataset, so none is reported.
+    userMetadata,
+    ...(mtime === undefined ? {} : { mtime }),
+    // Neither an owner nor a list: HDF5 records no principals.
+    version: (mtime ?? 0) + size,
+  };
+}
+
+/** The value of a call, or undefined where it threw. */
+function safely<T>(f: () => T): T | undefined {
+  try {
+    return f();
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -245,6 +322,13 @@ export async function readValueOf(store: Store, ref: ObjRef, offset = 0,
     const size = ref.entry.size;
     const want = Math.max(Math.min(length ?? size - offset, size - offset), 0);
     return ref.src.value(ref.path, offset, want);
+  }
+  if (ref.kind === "hdf5") {
+    const address = ref.element.object?.address;
+    if (address === undefined) {
+      throw new HDF5Error(`${ref.path} presents no dataset to read`);
+    }
+    return ref.h5.value(address, offset, length);
   }
   return ref.fs.readFile(ref.entry, offset, length);
 }

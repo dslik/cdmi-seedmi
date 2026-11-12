@@ -30,6 +30,7 @@ import {
   type DirRef, type ObjRef, nodeOf, presentableEntry, viewOf,
 } from "./objects.ts";
 import { ATTR_DIRECTORY, BufferImage, FAT } from "./fat.ts";
+import { HDF5 } from "./hdf5.ts";
 import { NF4DIR } from "./nfs.ts";
 import { type NfsSource, type NfsSourceOptions, nfsSource } from "./nfs-import.ts";
 import {
@@ -110,6 +111,17 @@ export interface EntryState {
   problems: Problem[];
   /** The object ID of the import source, for an image import. */
   sourceObjectID?: string;
+  /**
+   * Whether the import source cannot change while the entry is present, where
+   * this server has determined it, and undefined where it has determined
+   * neither: "a CDMI server shall not report a value it has not obtained"
+   * [5UYWY0FV].
+   *
+   * It is determined here, where the source has already been resolved, and
+   * not again where the entry is reported: a field determined in two places
+   * would be determined two ways.
+   */
+  immutable?: boolean;
 }
 
 /** A presented container object. */
@@ -248,10 +260,128 @@ function cachedImage(key: string): FAT | undefined {
   return open?.fs;
 }
 
+/**
+ * The HDF5 files a view's image layers were opened from.
+ *
+ * These are kept apart from the file systems above because an import of this
+ * format is read-only: there is nothing to write back, so none of the
+ * machinery that exists to write a change into the value of the source data
+ * object applies. What is shared is the reason for caching at all, which is
+ * that the whole value is read and interpreted on open.
+ */
+const openFormats = new Map<string, HDF5>();
+
+function cacheHDF5(key: string, h5: HDF5): HDF5 {
+  openFormats.delete(key);
+  openFormats.set(key, h5);
+  while (openFormats.size > MAX_OPEN_IMAGES) {
+    const oldest = openFormats.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    openFormats.delete(oldest);
+  }
+  return h5;
+}
+
+function cachedHDF5(key: string): HDF5 | undefined {
+  const h5 = openFormats.get(key);
+  if (h5) cacheHDF5(key, h5); // it becomes the most recently used
+  return h5;
+}
+
+/**
+ * Whether an object this server holds is within a snapshot, and so cannot be
+ * modified.
+ *
+ * The test is on the path the store holds for the object, built from its
+ * parent chain, and not on the text of the URI an entry states: the same
+ * object may be addressed through the object ID tree, where no path segment
+ * says where it sits, and the determination is about the object.
+ */
+export function withinSnapshot(store: Store, n: Node): boolean {
+  try {
+    // The same whole-segment test the URI form uses, so that the two cannot
+    // come to disagree about what counts as being within a snapshot.
+    return store.pathOf(n).split("/").includes(SNAPSHOTS);
+  } catch {
+    // An object whose path cannot be built is one whose place this server
+    // cannot establish, so nothing has been determined.
+    return false;
+  }
+}
+
+/**
+ * Whether a URI addresses a path within a snapshot. The reserved name is
+ * matched as a whole path segment, so an object named, say,
+ * "cdmi_snapshots_old" is not mistaken for one.
+ */
+function snapshotPath(uri: string | undefined): boolean {
+  if (uri === undefined) return false;
+  let path = uri;
+  try {
+    // An absolute URI names another server; its path is what carries the
+    // reserved name. A relative one is already a path.
+    if (/^[a-z][a-z0-9+.-]*:/i.test(uri)) path = new URL(uri).pathname;
+  } catch {
+    return false;
+  }
+  return path.split("/").includes(SNAPSHOTS);
+}
+
+/**
+ * Whether the import source of an entry cannot change while the entry is
+ * present, or undefined where this server has determined neither.
+ *
+ * What a server can determine is the import type's to say, and each type says
+ * something different, so the types are listed here rather than a single rule
+ * being guessed at:
+ *
+ * - An image import is "true" where the data object holding the image is
+ *   within a snapshot and "false" for any other [9CGCP0J6]. The source is an
+ *   object this server holds, so the determination is of the object.
+ * - A CDMI import is "true" where the import_uri addresses a path within a
+ *   snapshot and "false" for any other [441W7YK8], [5RROT8TH]. Here the
+ *   determination is of the *path*, not of an object: the subclause rests it
+ *   on "cdmi_snapshots" being a reserved name of the document, which is what
+ *   makes it determinable "whether this CDMI server or another CDMI server
+ *   holds it". A remote source this server cannot inspect is still
+ *   determinable from the name alone.
+ * - An SMB import is always "false": write protection a server observes says
+ *   that this server cannot write to the share, not that nothing can
+ *   [4RH4YYUT].
+ * - An MQTT import is always "false": the protocol offers no way to establish
+ *   that no further publication will be made [0VI1HYR0].
+ * - An NFS import is "true" only where the fs_status attribute reports
+ *   STATUS4_FIXED, and the field is absent where the attribute is not
+ *   obtained [3OOZ92LX], [6IOT1NT2]. This server does not obtain it — it is
+ *   an NFSv4.1 attribute this client does not ask for — so nothing is
+ *   determined and the field is absent.
+ * - A "self" entry has no import source and so no such field at all; the CDDL
+ *   rule import-self omits it.
+ */
+function immutabilityOf(store: Store, entry: ImportEntry,
+  source: Node | undefined): boolean | undefined {
+  switch (entry.type) {
+    case "image":
+      // The source is resolved by the caller; where it could not be, nothing
+      // is determined rather than "false" being reported for an object this
+      // server has not found.
+      return source === undefined ? undefined : withinSnapshot(store, source);
+    case "CDMI":
+      return snapshotPath(entry.import_uri);
+    case "SMB":
+    case "MQTT":
+      return false;
+    default:
+      // NFS, and any type whose subclause this server has not implemented.
+      return undefined;
+  }
+}
+
 /** Forgets every open image, which a test does between stores. */
 export function forgetImages(): void {
   openImages.clear();
   imagesOfFS.clear();
+  openFormats.clear();
 }
 
 /** The child of a layer's directory by name, of either kind. */
@@ -314,6 +444,23 @@ async function lookupIn(store: Store, dir: DirRef, name: string):
       isContainer,
     };
   }
+  if (dir.kind === "hdf5") {
+    // The namespace is a map of the paths the file presents, so a name is
+    // looked up by the path it would hang from rather than by walking the
+    // file again. An element the file holds but does not present is not
+    // found, the same as one that is not there: the reason it is not
+    // presented is reported on the container, not in place of the object.
+    const path = `${dir.path === "/" ? "" : dir.path}/${name}`;
+    const element = dir.h5.present().get(path);
+    if (element === undefined || element.presents === "not-presented") return undefined;
+    // A reference holds no object, so it is not looked up as one: it is
+    // listed as a reference and resolved by referenceIn, below.
+    if (element.presents === "reference") return undefined;
+    return {
+      ref: { kind: "hdf5", h5: dir.h5, path, element },
+      isContainer: element.presents === "container",
+    };
+  }
   const e = await dir.fs.find(dir.cluster, name);
   if (!e || !presentableEntry(e)) return undefined;
   return {
@@ -349,6 +496,27 @@ async function childrenOf(store: Store, dir: DirRef):
     const entries = await dir.src.children(dir.path).catch(() => []);
     return entries.map((e) => ({ name: e.name, isContainer: e.type === NF4DIR }));
   }
+  if (dir.kind === "hdf5") {
+    // The children of a path are the presented elements one level below it.
+    // An element the file holds but does not present is not listed; why it
+    // is not is reported on the importing object.
+    const prefix = dir.path === "/" ? "/" : `${dir.path}/`;
+    const out: { name: string; isContainer: boolean; reference?: string }[] = [];
+    for (const [path, element] of dir.h5.present()) {
+      if (!path.startsWith(prefix) || path === dir.path) continue;
+      const name = path.slice(prefix.length);
+      if (name === "" || name.includes("/")) continue;
+      if (element.presents === "not-presented") continue;
+      out.push({
+        name,
+        isContainer: element.presents === "container",
+        ...(element.presents === "reference"
+          ? { reference: element.reference?.value ?? "" }
+          : {}),
+      });
+    }
+    return out;
+  }
   return (await dir.fs.list(dir.cluster))
     .filter(presentableEntry)
     .map((e) => ({ name: e.name, isContainer: (e.attr & ATTR_DIRECTORY) !== 0 }));
@@ -362,6 +530,9 @@ function dirOf(ref: ObjRef): DirRef {
   }
   if (ref.kind === "fs") {
     return { kind: "fs", src: ref.src, path: ref.path, entry: ref.entry };
+  }
+  if (ref.kind === "hdf5") {
+    return { kind: "hdf5", h5: ref.h5, path: ref.path, element: ref.element };
   }
   return { kind: "image", fs: ref.fs, cluster: ref.entry.cluster, entry: ref.entry };
 }
@@ -667,6 +838,12 @@ export class Resolver {
       }
       const st: EntryState = { entry, index: i, active: false, problems: [] };
       v.entries.push(st);
+      // Whether the import source can change. It is determined for every
+      // entry, whether or not the entry turns out to be active: the field
+      // says what can change the source, which is not the same question as
+      // whether the source was reached. The image type refines this below,
+      // once the source object has been resolved.
+      st.immutable = immutabilityOf(this.store, entry, undefined);
       const write = isWriteTarget(entry);
 
       if (isDisabled(entry)) {
@@ -761,15 +938,44 @@ export class Resolver {
         }
         st.active = true;
         st.sourceObjectID = opened.sourceObjectID;
+        // The data object holding the image has now been resolved, so
+        // whether it is within a snapshot is determinable [9CGCP0J6].
+        st.immutable = immutabilityOf(this.store, entry, opened.source);
+        const via = [{
+          type: entry.type,
+          import_definition_uri: ns,
+          import_uri: entry.import_uri,
+        }, ...objLayer.via];
+        if (opened.h5 !== undefined) {
+          const h5 = opened.h5;
+          v.layers.push({
+            dir: { kind: "hdf5", h5, path: "/", element: h5.present().get("/") },
+            rank: [i],
+            via,
+            imported: true,
+            // An object of an image has no object ID at all, so the
+            // preserve_objectid field has nothing to preserve.
+            hideIDs: true,
+            // An import of this format is read-only whatever the entry says:
+            // the namespace is a graph of typed datasets whose meaning lives
+            // in the datatype and dataspace messages, and a write through it
+            // would have to invent that meaning.
+            readOnly: true,
+          });
+          v.importGovernor = node;
+          if (write) {
+            v.writeWhy = "an import of the HDF5 format is read-only";
+            v.writeUnavail = sourceUnavailable(i, ns,
+              "the write target, import entry %s of %s, is an import of the " +
+              "HDF5 format, which is read-only", i, ns);
+          }
+          continue;
+        }
         const fs = opened.fs!;
         v.layers.push({
           dir: { kind: "image", fs, cluster: fs.rootDirectory },
           rank: [i],
-          via: [{
-            type: entry.type,
-            import_definition_uri: ns,
-            import_uri: entry.import_uri,
-          }, ...objLayer.via],
+          via,
           imported: true,
           // An object of a file system image has no object ID at all, so
           // the preserve_objectid field has nothing to preserve.
@@ -875,9 +1081,17 @@ export class Resolver {
    */
   private async openImage(node: Node, index: number, entry: ImportEntry): Promise<{
     fs?: FAT;
+    h5?: HDF5;
     sourceObjectID?: string;
+    /** The data object holding the image, where it was resolved. */
+    source?: Node;
     problem?: Problem;
   }> {
+    // Which format to interpret the value as. The field is mandatory for an
+    // image entry and is checked against the formats this server offers when
+    // the entry is accepted, so by here it names one of them.
+    const format = (entry.format ?? "").toLowerCase();
+    const family = format === "hdf5" ? "HDF5" : "the FAT family";
     const problemOf = (type: string, title: string, detail: string) =>
       ({ problem: importProblem(type, title, detail) });
     let source: Node;
@@ -892,9 +1106,15 @@ export class Resolver {
         `${entry.import_uri} addresses a container object, not a data object`);
     }
     const m = this.store.meta(source);
-    const key = `${m.objectID}#${m.version}#${entry.partition ?? ""}#${entry.offset ?? ""}`;
-    const cached = cachedImage(key);
-    if (cached) return { fs: cached, sourceObjectID: m.objectID };
+    const key =
+      `${m.objectID}#${m.version}#${format}#${entry.partition ?? ""}#${entry.offset ?? ""}`;
+    if (format === "hdf5") {
+      const held = cachedHDF5(key);
+      if (held) return { h5: held, sourceObjectID: m.objectID, source };
+    } else {
+      const cached = cachedImage(key);
+      if (cached) return { fs: cached, sourceObjectID: m.objectID, source };
+    }
 
     const value = await this.store.readValue(source);
     const image = new BufferImage(value);
@@ -907,14 +1127,34 @@ export class Resolver {
       ...(pt.name !== undefined ? { name: pt.name } : {}),
     }));
 
-    /** Opens the file system at a place within the value. */
-    const openAt = async (view: BufferImage | PartitionImage, base: number) => {
+    /**
+     * Opens the format at a place within the value, or reports that it is
+     * not there. Which format is opened is the entry's to say: the server
+     * locates a format it was told to expect, and does not decide from the
+     * bytes which of several it has, because a value that could be read as
+     * either would then be read as whichever was tried first.
+     */
+    const openAt = async (view: BufferImage | PartitionImage, base: number):
+      Promise<FAT | HDF5 | undefined> => {
       try {
-        return await FAT.open(view, base);
+        return format === "hdf5"
+          ? await HDF5.open(view, base)
+          : await FAT.open(view, base);
       } catch {
         return undefined;
       }
     };
+
+    /** Holds the opened format for the next request, and reports it. */
+    const keep = (opened: FAT | HDF5, base: number) => opened instanceof HDF5
+      // An import of this format is read-only, so nothing is written back
+      // and the base is not kept with it.
+      ? { h5: cacheHDF5(key, opened), sourceObjectID: m.objectID, source }
+      : {
+        fs: cacheImage(key, { fs: opened, image, source, base }),
+        sourceObjectID: m.objectID,
+        source,
+      };
 
     // The partition and offset fields state where the file system begins;
     // where neither is given the CDMI server locates it.
@@ -926,23 +1166,20 @@ export class Resolver {
         : undefined;
       if (!part) {
         return {
-          problem: importProblem("filesystem/matching-partition-not-found",
+          problem: importProblem("format/matching-partition-not-found",
             "No matching partition was found.",
             `the value holds no partition numbered ${want}`, { cdmi_partitions: describe() }),
         };
       }
       if (!fs) {
         return {
-          problem: importProblem("filesystem/not-recognized",
-            "The file system was not recognized.",
-            `partition ${want} holds no file system of the FAT family`,
+          problem: importProblem("format/not-recognized",
+            "The format was not recognized.",
+            `partition ${want} holds no ${family}`,
             { cdmi_partitions: describe() }),
         };
       }
-      return {
-        fs: cacheImage(key, { fs, image, source, base: part.offset }),
-        sourceObjectID: m.objectID,
-      };
+      return keep(fs, part.offset);
     }
 
     if (entry.offset !== undefined) {
@@ -950,12 +1187,12 @@ export class Resolver {
       const fs = await openAt(image, base);
       if (!fs) {
         return {
-          problem: importProblem("filesystem/not-recognized",
-            "The file system was not recognized.",
-            `the value holds no file system of the FAT family at byte ${base}`),
+          problem: importProblem("format/not-recognized",
+            "The format was not recognized.",
+            `the value holds no ${family} at byte ${base}`),
         };
       }
-      return { fs: cacheImage(key, { fs, image, source, base }), sourceObjectID: m.objectID };
+      return keep(fs, base);
     }
 
     // Neither field: locate the file system.
@@ -963,41 +1200,37 @@ export class Resolver {
       const fs = await openAt(image, 0);
       if (!fs) {
         return {
-          problem: importProblem("filesystem/not-recognized",
-            "The file system was not recognized.",
-            "the value holds no partition table and no file system of the FAT family"),
+          problem: importProblem("format/not-recognized",
+            "The format was not recognized.",
+            `the value holds no partition table and no ${family}`),
         };
       }
-      return { fs: cacheImage(key, { fs, image, source, base: 0 }), sourceObjectID: m.objectID };
+      return keep(fs, 0);
     }
-    const matching: { part: typeof table.partitions[number]; fs: FAT }[] = [];
+    const matching: { part: typeof table.partitions[number]; fs: FAT | HDF5 }[] = [];
     for (const pt of table.partitions) {
       const fs = await openAt(new PartitionImage(image, pt.offset, pt.bytes), 0);
       if (fs) matching.push({ part: pt, fs });
     }
     if (matching.length === 0) {
       return {
-        problem: importProblem("filesystem/matching-partition-not-found",
+        problem: importProblem("format/matching-partition-not-found",
           "No matching partition was found.",
-          "the value holds no partition within which a file system of the FAT family is " +
-          "recognized", { cdmi_partitions: describe() }),
+          `the value holds no partition within which ${family} is recognized`,
+          { cdmi_partitions: describe() }),
       };
     }
     if (matching.length > 1) {
       // The CDMI server does not choose between them.
       return {
-        problem: importProblem("filesystem/matching-partition-ambiguous",
+        problem: importProblem("format/matching-partition-ambiguous",
           "More than one partition matches.",
-          `the value holds ${matching.length} partitions within which a file system of ` +
-          "the FAT family is recognized, and the import entry specifies neither a " +
+          `the value holds ${matching.length} partitions within which ${family} ` +
+          "is recognized, and the import entry specifies neither a " +
           "partition nor an offset", { cdmi_partitions: describe() }),
       };
     }
-    return {
-      fs: cacheImage(key,
-        { fs: matching[0].fs, image, source, base: matching[0].part.offset }),
-      sourceObjectID: m.objectID,
-    };
+    return keep(matching[0].fs, matching[0].part.offset);
   }
 
   /**
@@ -1297,6 +1530,26 @@ function isNotFound(err: unknown): boolean {
 /** The destination where a name of a view is a reference, in any layer. */
 export function referenceIn(store: Store, v: View, name: string): string | undefined {
   for (const l of v.layers) {
+    if (l.dir.kind === "hdf5") {
+      const inFile = l.dir.path === "/" ? "" : l.dir.path;
+      const element = l.dir.h5.present().get(`${inFile}/${name}`);
+      if (element?.presents !== "reference") continue;
+      const value = element.reference?.value ?? "";
+      // A soft link names a path within the same file, which is a path of
+      // this namespace under the import root, so the destination is that
+      // path and not the one the file states: a client given "/readings/x"
+      // would resolve it against the root of the server, where there is no
+      // such object. The import root is what remains of this view's
+      // namespace path once the path within the file is taken off it.
+      const suffix = `${inFile}/`;
+      const mount = v.ns.endsWith(suffix)
+        ? v.ns.slice(0, v.ns.length - suffix.length)
+        : v.ns.replace(/\/$/, "");
+      // A soft link's value may be relative, in which case it is relative to
+      // the group that holds it.
+      if (value.startsWith("/")) return `${mount}${value}`;
+      return `${mount}${inFile}/${value}`;
+    }
     if (l.dir.kind !== "store") continue;
     const n = store.tryLookup(l.dir.node, name);
     if (!n) continue;

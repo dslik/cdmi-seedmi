@@ -2,11 +2,11 @@
 
 A CDMI 3.0 server and the programs it is deployed with, written to find defects in the specification by implementing it closely.
 
-Version 0.134. Six programs making up a CDMI reference implementation:
+Version 0.135. Six programs making up a CDMI reference implementation:
 
 | Directory | Program | Version |
 |---|---|---|
-| [`seedmi/`](seedmi/) | a CDMI 3.0 server: the reference implementation of the specification | 0.134.0 |
+| [`seedmi/`](seedmi/) | a CDMI 3.0 server: the reference implementation of the specification | 0.135.0 |
 | [`seedmi-kms/`](seedmi-kms/) | a KMIP 1.4 key management server, run and configured on its own | 1.1.0 |
 | [`seedmi-dac/`](seedmi-dac/) | a delegated access control provider, which decides an access a CDMI server refers to it | 0.12.0 |
 | [`seedmi-dc/`](seedmi-dc/) | a domain controller: LDAP, SCIM, OAuth and a key distribution centre, at which a CDMI server resolves the principals of a domain | 1.12.0 |

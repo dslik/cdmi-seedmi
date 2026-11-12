@@ -83,8 +83,14 @@ export interface ImportEntry {
   required?: string;
   resource?: string;
   preserve_objectid?: string;
+  /**
+   * Whether the import source cannot change while the entry is present. CDMI
+   * server populated: ignored where a client supplies it, and absent where
+   * this server has determined neither [5UYWY0FV].
+   */
+  immutable?: string;
   /** Image imports. */
-  filesystem?: string;
+  format?: string;
   partition?: string;
   offset?: string;
 }
@@ -153,20 +159,20 @@ const COMMON = ["type", "write_enabled", "disabled", "required",
 const ADDRESSING = ["import_uri", "identity_mode", "credential_id"];
 
 const FIELDS: Record<string, string[]> = {
-  CDMI: [...COMMON, ...ADDRESSING, "resource", "preserve_objectid", "auth_method", "username", "protocol"],
+  CDMI: [...COMMON, ...ADDRESSING, "immutable", "resource", "preserve_objectid",
+    "auth_method", "username", "protocol"],
+  // A "self" entry imports no namespace and has no import source, so it has
+  // no immutable field: the CDDL rule import-self omits it, where every
+  // other rule carries it.
   self: [...COMMON],
-  // "An HTTP import presents the representation an origin server returns
-  // for one URI as the value of a data object." It is a value import: the
-  // source holds a sequence of bytes and no namespace (revision 327).
-  HTTP: [...COMMON, "import_uri", "protocol", "cache_max_age", "auth_method",
-    "username", "credential_id", "trust_anchor", "etag", "last_modified"],
   // An image import has no preserve_objectid field: an object it presents
   // has no object ID at all, so there is none to preserve.
-  image: [...COMMON, "import_uri", "identity_mode", "filesystem", "partition", "offset",
-    "source_objectid"],
-  NFS: [...COMMON, ...ADDRESSING, "protocol", "security", "transport", "port",
+  image: [...COMMON, "import_uri", "identity_mode", "immutable", "format", "partition",
+    "offset", "source_objectid"],
+  NFS: [...COMMON, ...ADDRESSING, "immutable", "protocol", "security", "transport", "port",
     "follow_symlinks", "anon_uid", "anon_gid"],
-  SMB: [...COMMON, ...ADDRESSING, "protocol", "username", "domain", "domain_servers", "signing",
+  SMB: [...COMMON, ...ADDRESSING, "immutable", "protocol", "username", "domain",
+    "domain_servers", "signing",
     "encryption", "follow_reparse", "auth_method", "max_sessions"],
   // An MQTT import is placed on a queue object and enqueues the messages of
   // a topic. "An MQTT import entry contains the fields common to every
@@ -178,7 +184,7 @@ const FIELDS: Record<string, string[]> = {
   // was always permitted (weedmi IMQT-001). identity_mode remains excluded:
   // an MQTT import performs no operation as a principal.
   MQTT: ["type", "write_enabled", "disabled", "required", "active",
-    "last_problems", "state_determined_time",
+    "last_problems", "state_determined_time", "immutable",
     "import_uri", "protocol", "qos", "clean_session",
     "keep_alive_interval", "username", "password_secret_id", "refresh_interval", "tls",
     "mimetype", "value_transfer_encoding", "client_id",
@@ -257,22 +263,26 @@ const NFS_PROTOCOLS: Record<string, string> = {
 const NFS_NEGOTIATED = ["NFSv4.1", "NFSv4.2"];
 
 /**
- * The file systems seedmi can interpret, the cdmi_import_filesystems
- * capability. FAT12, FAT16 and FAT32 differ in the width of one table and
- * in where the root directory sits, and are otherwise one format, so they
- * are offered under a single identifier and the driver determines which it
- * has by counting the data clusters, as the specification requires.
+ * The formats seedmi can interpret in the value of a data object it holds,
+ * the `cdmi_import_image_format` capability.
+ *
+ * ECO-120B generalised this category from "file system import" to **format
+ * import**: "any format whose contents form a hierarchy of named elements, of
+ * which a file system is one kind". The capability went with it, from one
+ * `cdmi_import_filesystems` for the server to a `cdmi_import_image_format`
+ * for the image import type, and the entry's field from `filesystem` to
+ * `format`. A server need only name the formats it interprets, so this list is
+ * the whole of what seedmi claims.
+ *
+ * FAT12, FAT16 and FAT32 differ in the width of one table and in where the
+ * root directory sits, and are otherwise one format, so they are offered under
+ * a single identifier and the driver determines which it has by counting the
+ * data clusters, as the specification requires.
  */
-export const FILESYSTEMS = ["fat"];
+export const FORMATS = ["fat", "hdf5"];
 
 /** The MQTT versions an import negotiates with a broker. */
 export const MQTT_IMPORT_VERSIONS = MQTT_VERSIONS;
-
-/**
- * The versions of HTTP this server negotiates with an origin server, as the
- * cdmi_import_http_versions capability reports them (revision 327).
- */
-export const HTTP_IMPORT_VERSIONS = ["HTTP/1.1"];
 
 /**
  * Whether this server is able to obtain a token for the requesting
@@ -554,61 +564,15 @@ function parseEntry(i: number, raw: unknown, ns: string, opts: ParseOptions): Im
     return e;
   }
 
-  if (type === "HTTP") {
-    const uri = str("import_uri");
-    if (uri === undefined) {
-      throw invalidField(`${base}/import_uri`, "an HTTP import entry names the URI it presents");
-    }
-    // "Its scheme shall be https, and a CDMI server shall report the
-    // invalid field condition for any other scheme": the exchange carries
-    // a credential, and what it returns becomes the value of an object of
-    // this server's namespace.
-    if (!uri.toLowerCase().startsWith("https://")) {
-      throw invalidField(`${base}/import_uri`,
-        "the URI of an HTTP import has the https scheme, and %j has not", uri);
-    }
-    e.import_uri = uri;
-    const versions = versionsOf(obj.protocol, HTTP_IMPORT_VERSIONS);
-    if (versions === undefined) {
-      throw invalidField(`${base}/protocol`, "the protocol field is an array of JSON strings");
-    }
-    for (const v of versions) {
-      if (!HTTP_IMPORT_VERSIONS.includes(v)) {
-        throw invalidField(`${base}/protocol`,
-          "%j is not a version of HTTP this server negotiates; it negotiates %s",
-          v, HTTP_IMPORT_VERSIONS.join(", "));
-      }
-    }
-    e.httpProtocol = versions;
-    const age = str("cache_max_age");
-    if (age !== undefined && !/^[0-9]+$/.test(age)) {
-      throw invalidField(`${base}/cache_max_age`,
-        "the cache_max_age field is a number of seconds as a decimal integer");
-    }
-    e.cache_max_age = age;
-    const auth = str("auth_method") ?? "none";
-    if (!["none", "basic", "bearer"].includes(auth)) {
-      throw invalidField(`${base}/auth_method`,
-        "the authentication scheme of an HTTP import is none, basic or bearer");
-    }
-    e.auth_method = auth;
-    // "Conditional: present where auth_method contains basic."
-    const username = str("username");
-    if (auth === "basic" && username === undefined) {
-      throw invalidField(`${base}/username`,
-        "an HTTP import that authenticates by the basic scheme names a user");
-    }
-    e.username = username;
-    // "A credential reference ... addressing a managed object of type
-    // Certificate, being the trust anchor against which the CDMI server
-    // verifies the certificate the origin server presents ... Where absent,
-    // the CDMI server verifies against the trust anchors it is configured
-    // with" (revision 365).
-    e.trust_anchor = referenceIn("trust_anchor");
-    // etag and last_modified are CDMI server populated: a value a client
-    // supplies for either is ignored.
-    return e;
-  }
+  // The HTTP import type is withdrawn. ECO-120B removed it from the
+  // specification: `http_imports.txt` is gone, `cdmi_import_http` and
+  // `cdmi_import_http_versions` with it, and the sentence making an HTTP
+   // import the one exception that could run in either identity mode went too.
+  //
+  // It was this server's only import of the VALUE category on a data object,
+  // so with it goes the ability to place an import on a data object at all:
+  // the value category survives for a queue object, where an MQTT import
+  // presents a sequence of messages, and nowhere else.
 
   if (type === "MQTT") {
     // An MQTT import subscribes to a topic filter of a broker and
@@ -987,18 +951,18 @@ function parseEntry(i: number, raw: unknown, ns: string, opts: ParseOptions): Im
   }
   e.identity_mode = "service";
 
-  const filesystem = str("filesystem");
-  if (filesystem === undefined) {
-    fail(invalidField(`${base}/filesystem`,
-      'the "filesystem" field is mandatory for an import entry of type "image"'));
+  const format = str("format");
+  if (format === undefined) {
+    fail(invalidField(`${base}/format`,
+      'the "format" field is mandatory for an import entry of type "image"'));
   }
   // A name is compared without regard to case.
-  if (!FILESYSTEMS.includes(filesystem!.toLowerCase())) {
-    fail(capabilityNotPresent("cdmi_import_filesystems", "/cdmi_capabilities/",
+  if (!FORMATS.includes(format!.toLowerCase())) {
+    fail(capabilityNotPresent("cdmi_import_image_format", "/cdmi_capabilities/",
       "seedmi interprets %s alone, and cannot interpret %j",
-      FILESYSTEMS.join(", "), filesystem));
+      FORMATS.join(", "), format));
   }
-  e.filesystem = filesystem;
+  e.format = format;
 
   const partition = str("partition");
   const offset = str("offset");

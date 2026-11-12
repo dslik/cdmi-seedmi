@@ -44,12 +44,9 @@ import {
   viewOf,
 } from "./objects.ts";
 import {
-  FILESYSTEMS, HTTP_IMPORT_VERSIONS, delegationConfigured, parseImports, type ImportEntry,
+  FORMATS, delegationConfigured, parseImports, type ImportEntry,
   localImportPath,
 } from "./imports.ts";
-import {
-  establish as establishImport, type HttpImportEntry, obtain as obtainImport, stillFresh,
-} from "./http-import.ts";
 import {
   Resolver, type View, denyChange, ensureImageWriteTarget, ensureWriteTarget, flushImage,
   importsProvidedFor, listChildren, presentable, rankCmp, referenceIn, resolveFile,
@@ -66,14 +63,14 @@ import { capabilityCondition,
 import {
   checkHeaderMetadataItem,
   Exports, HEADER_METADATA_MAXITEMS, HEADER_METADATA_MAXSIZE,
-  HEADER_METADATA_MAXTOTALSIZE, CDMI_EXPORT_VERSIONS, EXPORT_AUTH_METHODS,
+  HEADER_METADATA_MAXTOTALSIZE, CDMI_EXPORT_VERSIONS, MCP_EXPORT_VERSIONS, EXPORT_AUTH_METHODS,
 } from "./exports.ts";
 import { Discovery } from "./discovery.ts";
 import {
   addressOf, collectResponse, composeRequest, mediaTypeOf as mcpMediaTypeOf, rangeAsked,
   relativeToBase, remoteAddresses, representationOf, resultOf,
 } from "./mcp-operations.ts";
-import type { ResourceServer as McpResourceServer } from "./mcp-auth.ts";
+import type { ResourceServer as McpResourceServer, TokenVerdict } from "./mcp-auth.ts";
 import {
   mcpAccountOf, mcpAccountOfProblem, mcpNotYet,
 } from "./mcp-account.ts";
@@ -975,6 +972,19 @@ function importsRep(v: View): unknown[] {
       e.identity_mode = "delegated";
     }
     if (st.sourceObjectID !== undefined) e.source_objectid = st.sourceObjectID;
+    // "The field shall be absent where the CDMI server has determined
+    // neither, and a CDMI server shall not report a value it has not
+    // obtained" [5UYWY0FV]. A client that supplied the field supplied
+    // nothing: it is CDMI server populated, so whatever it sent is replaced
+    // where this server determined a value and removed where it did not.
+    if (st.immutable === undefined) delete e.immutable;
+    else e.immutable = st.immutable ? "true" : "false";
+    // "The field shall be absent where the CDMI server has determined
+    // neither, and a CDMI server shall not report a value it has not
+    // obtained" [5UYWY0FV]. A client that supplied the field supplied
+    // nothing: it is CDMI server populated, so whatever it sent is replaced
+    // where this server determined a value and removed where it did not.
+
     e.active = st.active ? "true" : "false";
     e.last_problems = st.problems;
     e.state_determined_time = now;
@@ -3118,7 +3128,6 @@ export class Binding {
     // read, and thereafter as the cache_max_age field provides" (revision
     // 327, HTTP imports). The value, the mimetype and the times come from
     // what the origin server returns.
-    if (ref.kind === "store") await this.refreshHttpImport(ref.node, `${pv.ns}${name}`);
     if (sel.fields.includes("children")) {
       throw invalidSelection("children", "the children selection does not apply to a data object");
     }
@@ -6439,39 +6448,16 @@ export class Binding {
       return;
     }
     this.demand(node, who, M.WRITE_METADATA, false, `changing the imports of ${ns}`);
-    const bound = body.imports;
-    const entries = parseImports(bound, ns, { kms: this.keyManagement.length > 0 });
-    for (const e of entries) {
-      if (e.type !== "HTTP") {
-        throw invalidField("/imports/0/type",
-          "an import entry on a data object is of type HTTP, and presents what an " +
-          "origin server returns as the value; %j presents a namespace and is " +
-          "placed on a container object", e.type);
-      }
-    }
-    // "A CDMI server establishes the import by issuing a HEAD request for
-    // the URI, which confirms that the origin server serves it and provides
-    // the header fields the CDMI server records ... Where the request does
-    // not succeed, the CDMI server shall report the import as not active
-    // and shall record the condition in the last_problems field."
-    for (const e of entries) {
-      try {
-        const got = await establishImport(e as HttpImportEntry,
-          () => this.importSecret(node, e), () => this.importTrustAnchor(node, e));
-        if (got.status >= 200 && got.status < 300) {
-          e.etag = got.etag;
-          e.last_modified = got.lastModified;
-          (e as { last_problems?: unknown[] }).last_problems = [];
-        } else {
-          (e as { last_problems?: unknown[] }).last_problems =
-            [`the origin server answered ${got.status}`];
-        }
-      } catch (err) {
-        (e as { last_problems?: unknown[] }).last_problems =
-          [`the origin server could not be reached: ${(err as Error).message}`];
-      }
-    }
-    this.setDataImports(node, entries);
+    // No import type may be placed on a data object. The HTTP import was the
+    // only one that could, and ECO-120B withdrew it; the value category it
+    // belonged to survives for a queue object, where an MQTT import presents a
+    // sequence of messages. The field is parsed first so that a malformed
+    // entry is reported as malformed rather than as misplaced.
+    const entries = parseImports(body.imports, ns, { kms: this.keyManagement.length > 0 });
+    throw invalidField("/imports/0/type",
+      "no import type is placed on a data object: %j presents a namespace and is placed on a " +
+      "container object, and a value import is placed on a queue object",
+      entries[0]?.type ?? "an import entry");
   }
 
   /**
@@ -9107,70 +9093,6 @@ export class Binding {
     this.demand(holder, who, bit, true, doing);
   }
 
-  /**
-   * Obtains the value of an object an HTTP import presents, where the value
-   * this server holds is not to be presented again.
-   *
-   * "A CDMI server obtains the value when the importing object is first read,
-   * and thereafter as the cache_max_age field provides. Where that field
-   * states an interval, the CDMI server obtains the value again by a
-   * conditional request, using the entity tag or the time the origin server
-   * last returned." A request that does not succeed leaves the value this
-   * server holds in place and records the condition, the import being
-   * reported not active rather than the read failing.
-   */
-  private async refreshHttpImport(node: Node, ns: string): Promise<void> {
-    const m = this.store.meta(node);
-    const entries = (m.imports ?? []) as unknown as ImportEntry[];
-    const entry = entries.find((e) => e.type === "HTTP");
-    if (entry === undefined) return;
-    const held = (entry as { obtainedAt?: number }).obtainedAt;
-    if (stillFresh(entry as HttpImportEntry, held)) return;
-    try {
-      const got = await obtainImport(entry as HttpImportEntry,
-        () => this.importSecret(node, entry), held !== undefined,
-        () => this.importTrustAnchor(node, entry));
-      const now = this.store.meta(node);
-      const held2 = (now.imports ?? []) as unknown as ImportEntry[];
-      const mine = held2.find((e) => e.type === "HTTP") ?? entry;
-      (mine as { obtainedAt?: number }).obtainedAt = Date.now();
-      (mine as { last_problems?: unknown[] }).last_problems = [];
-      if (got.status === 304) {
-        // The value this server holds is the value: nothing else changes.
-        this.store.setMeta(node, now);
-        return;
-      }
-      if (got.status < 200 || got.status >= 300) {
-        (mine as { last_problems?: unknown[] }).last_problems =
-          [`the origin server answered ${got.status}`];
-        this.store.setMeta(node, now);
-        return;
-      }
-      mine.etag = got.etag;
-      mine.last_modified = got.lastModified;
-      // "the mimetype field, from the Content-Type header field", and the
-      // size from the length of what was returned.
-      if (got.mimetype !== undefined) now.mimetype = got.mimetype;
-      // "the cdmi_mtime metadata item, from the Last-Modified header field,
-      // where the origin server returns one."
-      if (got.lastModified !== undefined) {
-        const at = Date.parse(got.lastModified);
-        if (!Number.isNaN(at)) now.mtime = at;
-      }
-      this.store.setMeta(node, now);
-      if (got.value !== undefined) await this.store.writeValue(node, 0, got.value);
-    } catch (err) {
-      const now = this.store.meta(node);
-      const held2 = (now.imports ?? []) as unknown as ImportEntry[];
-      const mine = held2.find((e) => e.type === "HTTP");
-      if (mine !== undefined) {
-        (mine as { last_problems?: unknown[] }).last_problems =
-          [`the origin server could not be reached: ${(err as Error).message}`];
-        this.store.setMeta(node, now);
-      }
-      void ns;
-    }
-  }
 
   /**
    * An object that holds a lock admits an update that removes the item or
@@ -9392,7 +9314,7 @@ export class Binding {
    * challenge that it requires "an access token of an authorization server
    * it accepts", and it has none.
    */
-  async acceptsToken(token: string): Promise<boolean> {
+  async acceptsToken(token: string): Promise<TokenVerdict> {
     // The authorization server this whole deployment accepts, configured in
     // [oauth] and used by the HTTP binding. 0.83 consulted the domain
     // controllers alone, so a deployment with an [oauth] issuer and no
@@ -9401,18 +9323,33 @@ export class Binding {
     // nine of weedmi's ten MCP tests unable to run (BMCP-010).
     if (this.directory.tokens !== undefined) {
       const p = this.directory.principalOfToken(token);
-      if (p !== undefined) return true;
+      if (p !== undefined) return "accepted";
     }
+    // Whether any authorization server that might have accepted the token
+    // could not be asked. A controller that cannot be reached has refused
+    // nothing: "A controller that cannot be reached is reported as 503, the
+    // credentials not being at fault", which the CDMI binding has always done
+    // and this method flattened into `false`. The MCP endpoint then told a
+    // client its token "was not issued for this CDMI server by an
+    // authorization server it accepts" — a claim about the token, made when
+    // the token had not been examined, which sends a reader to check the one
+    // thing that is not wrong. Measured: a token accepted a moment earlier,
+    // with the right issuer and the right audience, drew that answer with the
+    // only change being that the controller had stopped.
+    let unavailable: string | undefined;
     for (const controller of this.domainControllers?.all() ?? []) {
       try {
         const accepted = await controller.accept(`Bearer ${token}`, ["bearer"]);
-        if (accepted.principal.name !== ANONYMOUS.name) return true;
-      } catch {
-        // A controller that refuses the token, or that cannot be reached,
-        // does not decide for the others.
+        if (accepted.principal.name !== ANONYMOUS.name) return "accepted";
+      } catch (e) {
+        // A controller that refuses the token does not decide for the others,
+        // and neither does one that cannot be reached — but the second is
+        // remembered, because a verdict of "refused" with nothing reachable to
+        // refuse it is not a verdict.
+        if (isCondition(e) && e.status === 503) unavailable ??= e.detail || e.message;
       }
     }
-    return false;
+    return unavailable === undefined ? "refused" : { unavailable };
   }
 
   /**
@@ -10959,9 +10896,6 @@ export class Binding {
             // A part supplied from the value of an existing object.
             "cdmi_export_s3_multipart_copy",
             "cdmi_import_mqtt",
-            // An HTTP import presents what an origin server returns for one
-            // URI as the value of a data object, read only (revision 327).
-            "cdmi_import_http",
             // No S3 import: seedmi has no S3 client, so an entry is
             // refused and cdmi_import_s3 is not published.
             // A connection to a broker is made over TLS. A credential
@@ -10981,6 +10915,13 @@ export class Binding {
             // A CDMI export presents a container object at a base URI of
             // its own, served by this protocol binding (revision 327).
             "cdmi_export_cdmi",
+            // An MCP export presents a container object over the Model
+            // Context Protocol. "Support for the MCP export type is indicated
+            // by two capabilities" [5SKNWP3V]: this one at the root, and
+            // cdmi_export_container_mcp on the container object. The entry is
+            // validated and reported; the endpoint is not yet served, which
+            // NOTES-on-mcp-exports.md records.
+            "cdmi_export_mcp",
             "cdmi_export_http_anonymous_read",
             // The description of the requesting principal within a domain,
             // carried as a metadata item of the domain object since 0.106
@@ -11172,7 +11113,6 @@ export class Binding {
           cdmi_import_smb_versions: ["SMB2", "SMB2.1", "SMB3", "SMB3.0.2", "SMB3.1.1"],
           cdmi_export_mqtt_versions: ["3.1.1", "5.0"],
           cdmi_import_mqtt_versions: ["3.1.1", "5.0"],
-          cdmi_import_http_versions: HTTP_IMPORT_VERSIONS,
           // The lists entries are checked against (protocol-versions.ts).
           cdmi_export_http_versions: HTTP_EXPORT_VERSIONS,
           cdmi_export_s3_versions: S3_EXPORT_VERSIONS,
@@ -11223,7 +11163,7 @@ export class Binding {
           cdmi_queue_maxtotalsize: String(QUEUE_MAXTOTALSIZE),
           // A value transported as a JSON object.
           cdmi_valuetransferencoding_json: "true",
-          cdmi_import_filesystems: FILESYSTEMS,
+          cdmi_import_image_format: FORMATS,
           // A remote import may delegate only where this server is able
           // to obtain a token for the requesting principal.
           ...(delegationConfigured() ? yes("cdmi_import_cdmi_delegation") : {}),
@@ -11252,6 +11192,12 @@ export class Binding {
           // the container object in 0.99 and 0.100, and these from 0.101.
           cdmi_export_http_origins: this.exports?.opts.originCaps ?? [],
           cdmi_export_cdmi_origins: this.exports?.opts.originCaps ?? [],
+          // "The versions of the Model Context Protocol the CDMI server
+          // offers, and from which a value of the protocol field is drawn"
+          // [CR9WR6SW]. The same list the entry is checked against, so the
+          // two cannot disagree, and the same revision the MCP endpoint
+          // speaks, the version being declared once (mcp-version.ts).
+          cdmi_export_mcp_versions: MCP_EXPORT_VERSIONS,
           // "The authentication methods a CDMI server accepts for the HTTP
           // export, each a value the auth_method field of such an entry may
           // take": the same set the entry is checked against, so the two
@@ -11286,6 +11232,10 @@ export class Binding {
           ...yes(...containerCaps, "cdmi_export_container_http",
             "cdmi_export_container_nfs", "cdmi_export_container_smb",
             "cdmi_export_container_s3",
+            // "The placement of an MCP export entry on a container object"
+            // [2M2NJN0A], the second of the two capabilities an MCP export
+            // needs before a CDMI client configures one.
+            "cdmi_export_container_mcp",
             // "Support for an export type is indicated by two capabilities,
             // both of which shall be present before a CDMI client configures an
             // export of that type": cdmi_export_<type> at the root, and this
@@ -11299,6 +11249,15 @@ export class Binding {
             "cdmi_create_reference",
             "cdmi_delete_reference"),
           ...ACL_CAPABILITIES,
+          // "The origins at which the CDMI server serves an MCP export of it,
+          // and against which a value of the origins field is matched"
+          // [6HCNVXCS]. This one is published from the container object's
+          // capability object, as its subclause says, where the HTTP export's
+          // equivalent is published at the root (ECR-223A). The origins are
+          // the ones this server listens at, which are the same origins it
+          // serves an HTTP export from: one set of listeners serves both, so
+          // naming a different set here would say something untrue.
+          cdmi_export_container_mcp_origins: this.exports?.opts.originCaps ?? [],
           // A container object carries the cross-origin items, and the
           // value hash, which is data system metadata and so is inherited by
           // the objects the container holds: a CDMI client sets it once on a

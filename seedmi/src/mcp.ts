@@ -11,6 +11,7 @@
 // handshake, the tool list, and the routing of a call into the binding. The
 // operations themselves are the binding's, reached through the same paths
 // the HTTP binding uses, so that neither binding can be fixed alone.
+import { MCP_PROTOCOL_VERSION } from "./mcp-version.ts";
 import { createServer as createHttpServer, type IncomingMessage, type Server, type ServerResponse }
   from "node:http";
 import { createServer as createHttpsServer } from "node:https";
@@ -21,14 +22,17 @@ import {
 } from "./jsonrpc.ts";
 import { answerListenerPreflight, listenerAllows, listenerCorsOrVary, originOf } from "./cors.ts";
 import type { Log } from "./log.ts";
-import { type ResourceServer, Unauthenticated } from "./mcp-auth.ts";
+import { AuthenticationUnavailable, type ResourceServer, Unauthenticated } from "./mcp-auth.ts";
 import { checkPromptArguments, PROMPTS, promptList, promptMessages } from "./mcp-prompts.ts";
 import {
   codeOfProblem, contentsOf, pathOfResource, resourceList, resourceTemplates,
 } from "./mcp-resources.ts";
 
 /** The revision of the Model Context Protocol this binding speaks. */
-export const MCP_PROTOCOL_VERSION = "2026-07-28";
+// Declared in a module of its own so that an MCP export entry can name the
+// revisions it offers without importing this endpoint. Re-exported here
+// because this is where callers expect to find it.
+export { MCP_PROTOCOL_VERSION };
 
 /**
  * What this server offers, which revision 2026-07-28 carries in the result of
@@ -577,6 +581,33 @@ export interface McpOptions {
  * object. The stdio transport is for a client that launches its server as a
  * subprocess, which is not what a CDMI server is.
  */
+/**
+ * What a refused token says of itself, for the log. The claims are read without
+ * being trusted — nothing here has verified a signature — so this says what the
+ * token CLAIMS, and the signature is not among the things reported. The token
+ * itself is never logged: it is a credential until it expires.
+ */
+function presentedBy(req: { headers: Record<string, string | string[] | undefined> }): string | undefined {
+  const h = req.headers.authorization;
+  const one = Array.isArray(h) ? h[0] : h;
+  return one === undefined ? undefined : one.replace(/^Bearer\s+/i, "");
+}
+
+function describe(token: string | undefined): string {
+  if (token === undefined) return "no token was presented";
+  const parts = token.split(".");
+  if (parts.length !== 3) return "the credential presented is not a three-part JWT";
+  try {
+    const h = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8")) as Record<string, unknown>;
+    const c = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as Record<string, unknown>;
+    const aud = Array.isArray(c.aud) ? c.aud.join(" ") : String(c.aud);
+    return `it claims iss=${String(c.iss)} aud=${aud} sub=${String(c.sub)} ` +
+      `kid=${String(h.kid)} exp=${typeof c.exp === "number" ? new Date(c.exp * 1000).toISOString() : "none"}`;
+  } catch {
+    return "the credential presented is not a JWT this server can read";
+  }
+}
+
 export class Mcp {
   private server: Server | undefined;
 
@@ -605,6 +636,27 @@ export class Mcp {
   }
 
   private async serve(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    // One line per request, at the `requests` level, as the CDMI binding has
+    // always written. This endpoint wrote none: a deployment started with
+    // --log requests, watching a client fail against it, had no record that a
+    // request had arrived at all — so the first question of any diagnosis,
+    // whether the request reached this server and with what, could not be
+    // answered from here. Attached to `finish` so that every exit of this
+    // method is covered by one statement rather than each remembering.
+    //
+    // The credential is NOT logged, and neither is the body: the first is a
+    // bearer token until it expires and the second may hold object values.
+    // What is logged is what a reader needs to place the request — where it
+    // came from, whether it carried a credential, and what it was answered.
+    res.on("finish", () => {
+      const origin = req.headers.origin;
+      this.opts.log.write({
+        at: new Date().toISOString(),
+        message: `mcp: ${req.method} ${req.url ?? "/"} -> ${res.statusCode}` +
+          ` (${req.headers.authorization === undefined ? "no credential" : "bearer presented"}` +
+          `${origin === undefined ? "" : `, origin ${String(origin)}`})`,
+      } as never);
+    });
     // "Publish protected resource metadata as specified in RFC 9728": a
     // client that meets a challenge reads this to learn which authorization
     // servers issue a token for this endpoint.
@@ -687,10 +739,39 @@ export class Mcp {
         // the client can act on, it arrives as a failure to fetch — so before
         // 0.92 a browser client could not begin the authorization flow this
         // challenge exists to start.
+        // Logged, because nothing logged it. A refusal said only "the access
+        // token was not issued for this CDMI server by an authorization server
+        // it accepts", to the client, and wrote nothing anywhere — so an
+        // operator holding a token that every check passes had no next step and
+        // no record. The fingerprint of the key and the issuer and audience the
+        // token names are what identify which deployment it was issued by, and
+        // they are the first things a reader needs.
+        this.opts.log.write({
+          at: new Date().toISOString(),
+          message: `mcp: a bearer token was refused: ${e.message}. ${describe(presentedBy(req))}`,
+          failed: true,
+        } as never);
         res.writeHead(401, {
           "WWW-Authenticate": e.challenge,
           ...this.cors(req),
         }).end();
+        return;
+      }
+      if (e instanceof AuthenticationUnavailable) {
+        // 503, as the CDMI binding answers in the same case, and with no
+        // WWW-Authenticate: a challenge invites a client to present something
+        // else, and there is nothing else to present. Retry-After says the
+        // condition is this server's and is expected to pass.
+        res.writeHead(503, {
+          "Content-Type": "application/problem+json",
+          "Retry-After": "30",
+          ...this.cors(req),
+        }).end(JSON.stringify({
+          type: "https://snia.org/cdmi/problems/authentication-unavailable",
+          title: "The credentials presented could not be evaluated.",
+          detail: e.message,
+          status: 503,
+        }));
         return;
       }
       throw e;

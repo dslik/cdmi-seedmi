@@ -620,13 +620,39 @@ function getJson(uri: string, dc: DomainControllerConfig): Promise<unknown> {
     const req = httpsRequest({ hostname: host, port: Number(u.port || 443), path: `${u.pathname}${u.search}`, method: "GET",
       ...anchoredBy(dc.ca), timeout: dc.timeoutMs,
       ...(isIP(host) ? {} : { servername: host }) } as never, (res: never) => {
-      const r = res as { statusCode: number; on: (e: string, f: (d?: Buffer) => void) => void };
+      const r = res as { statusCode: number; socket?: unknown; on: (e: string, f: (d?: Buffer) => void) => void };
+      // The pin, enforced here as well as at the handshake. `anchoredBy` turns
+      // OFF certificate verification — rejectUnauthorized: false and a
+      // checkServerIdentity that returns nothing — and hands back the anchor
+      // for a caller to check instead. The LDAPS paths check it; this one did
+      // not, for every release that has had it.
+      //
+      // So the RFC 8414 metadata and the JWK Set of the authorization server
+      // were fetched over a TLS connection that was not authenticated at all,
+      // and the keys that decide which access tokens this server accepts came
+      // from whoever answered on that address and port. Demonstrated: a server
+      // on the controller's address, presenting its own self-signed
+      // certificate while ca_file named the real controller's, served its own
+      // JWK Set and seedmi accepted a token it had signed — sub "mallory",
+      // groups ["administrators"], every scope. Anyone able to answer there
+      // could be anyone here.
+      if (!enforcePin(r.socket as never, dc.ca)) {
+        return reject(new Unreachable(`${uri} presented a certificate other than the one ca_file names`));
+      }
       const chunks: Buffer[] = [];
       r.on("data", (d) => chunks.push(d!));
       r.on("end", () => {
         if (r.statusCode !== 200) return reject(new Unreachable(`${uri} answered ${r.statusCode}`));
         try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); } catch { reject(new Unreachable(`${uri} is not JSON`)); }
       });
+    });
+    // And at the handshake, so that a request is not sent to a server that is
+    // not the one named.
+    req.on("socket", (socket: unknown) => {
+      const s = socket as { on: (e: string, f: () => void) => void;
+        getPeerCertificate?: (d?: boolean) => { raw?: Buffer }; destroy: (e?: Error) => void };
+      if (s.getPeerCertificate?.()?.raw !== undefined) enforcePin(s as never, dc.ca);
+      else s.on("secureConnect", () => { enforcePin(s as never, dc.ca); });
     });
     req.on("timeout", () => req.destroy());
     req.on("error", (e: Error) => reject(new Unreachable(`${uri} cannot be reached: ${e.message}`)));

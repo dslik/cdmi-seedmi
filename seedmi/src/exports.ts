@@ -7,9 +7,10 @@
 // intermediary is reached at an address it cannot see (revision 49).
 
 import { uploadedFile } from "./multipart.ts";
-import { randomUUID } from "node:crypto";
+import { randomUUID, X509Certificate } from "node:crypto";
 import { boundReference } from "./credential.ts";
 import { HTTP_EXPORT_VERSIONS, parseVersions } from "./protocol-versions.ts";
+import { MCP_PROTOCOL_VERSION } from "./mcp-version.ts";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import {
   decideFor, delegatedHeaders, delegatedMask, delegationOf, DelegationRefused, withDelegation,
@@ -171,6 +172,12 @@ export const isNfs = (e: ExportEntry): e is NfsExport => e.type === "NFS";
  * until the exclusion was added.
  */
 export const isHttp = (e: ExportEntry): e is HttpExport => e.type === "HTTP";
+/**
+ * Whether the entry is an MCP export. It shares the shape of an HTTP export,
+ * since it is served at an origin and a path as one is; what differs is which
+ * fields it may carry and what is served beneath the path.
+ */
+export const isMcp = (e: ExportEntry): e is HttpExport => e.type === "MCP";
 export const isSmb = (e: ExportEntry): e is SmbExport => e.type === "SMB";
 
 /** The client-supplied fields of an HTTP export entry. */
@@ -205,6 +212,12 @@ export interface HttpExport {
   error_document?: string;
   max_age?: string;
   disabled?: string;
+  /**
+   * An MCP export alone: whether the export implements the CDMI over MCP
+   * protocol binding. "Permitted values are true and false. The default value
+   * shall be false" [ATL2MV7L].
+   */
+  binding?: string;
 }
 
 const FIELDS = new Set([
@@ -240,6 +253,33 @@ const CDMI_FIELDS = new Set([
   // document requires a CDMI server to ignore. Every other export type of this
   // server accepted them; this one type did not.
   "origins_provided", "active", "last_problems", "state_determined_time",
+]);
+
+/**
+ * The versions of the Model Context Protocol served through an MCP export, as
+ * the cdmi_export_mcp_versions capability reports them. "The only version this
+ * document defines is 2026-07-28" [3XSW67HS], which is the revision the CDMI
+ * over MCP binding of this server implements.
+ */
+export const MCP_EXPORT_VERSIONS = [MCP_PROTOCOL_VERSION];
+
+/**
+ * The fields of an MCP export entry.
+ *
+ * It carries the origins, path, certificates and auth_method of an HTTP
+ * export, and not that type's read_only, anonymous_read, index_document,
+ * error_document or max_age: an MCP export serves tool calls and not
+ * documents, so a field about documents is not defined for it and an entry
+ * supplying one is refused.
+ */
+const MCP_FIELDS = new Set([
+  "type", "protocol", "origins", "path", "certificates", "auth_method",
+  "binding", "disabled",
+  // CDMI server populated: accepted and ignored, so a CDMI client may write
+  // back what it read. "origins_provided" and "certificate_expiry" are
+  // Mandatory fields of this type and are populated [1NJOL90N], [850F5C9F].
+  "origins_provided", "certificate_expiry", "active", "last_problems",
+  "state_determined_time",
 ]);
 
 /** An export entry of type SMB. */
@@ -682,6 +722,36 @@ export function parseExports(raw: unknown, caps: string[], basePath: string,
  * refused with the capability withheld condition. Before 0.61 such an entry was an
  * invalid field, its origin matching no value. Returns nothing where origins are offered.
  */
+/**
+ * The problems of an MCP export that is otherwise well formed.
+ *
+ * The entry is validated, reported and held, and this server does not
+ * establish the endpoint. So no origin is served: origins_provided is empty
+ * and the entry is not active, and "an origin in origins and not in this
+ * field is not reachable, and the CDMI server shall record the reason in
+ * last_problems" [1NJOL90N] is the field the reason belongs in. Saying
+ * nothing would let a CDMI client read an entry reporting origins and a path
+ * and conclude that an MCP server answers there, which is the one thing it
+ * must not conclude.
+ *
+ * The condition is exports/mcp/origin-not-served, whose URI means what is
+ * meant here: "the CDMI server cannot serve the MCP endpoint at an origin the
+ * origins field names" [BIEZF5Y8]. Its "Reported where" column then narrows
+ * it, "that origin having become unavailable after the entry was accepted",
+ * which is not this case: here the endpoint was never established. Annex C
+ * defines no condition for an entry a CDMI server accepts and does not
+ * establish, so this is the nearest the document offers and the narrowing
+ * clause is a stretch. NOTES-on-mcp-exports.md raises it; the alternative
+ * was a problem type of this server's own invention under the reserved
+ * prefix, which would be worse, a CDMI client having nothing to look up.
+ */
+function mcpNotServed(name: string, origins: string[]): Problem[] {
+  return origins.map((o) => exportProblem("origin-not-served", name, o,
+    "this CDMI server validates and reports an MCP export entry and does not " +
+    "establish the MCP API endpoint the entry describes, so the endpoint is " +
+    "not served at this origin", "mcp"));
+}
+
 function httpOffered(caps: string[], basePath: string, name: string): undefined {
   if (caps.length > 0) return undefined;
   // "The namespace path of the capability object that a CDMI client reads in
@@ -746,6 +816,13 @@ function parseEntry(name: string, raw: unknown, caps: string[], basePath = "/"):
             "%j is not a version this CDMI server serves through an export; it serves %s",
             v, CDMI_EXPORT_VERSIONS.join(", "));
         }
+      }
+    }
+  } else if (type === "MCP") {
+    for (const k of Object.keys(obj)) {
+      if (!MCP_FIELDS.has(k)) {
+        throw invalidField(`${f}/${k}`,
+          'the field %j is not defined for an export entry of type "MCP"', k);
       }
     }
   } else if (type !== "HTTP") {
@@ -815,14 +892,43 @@ function parseEntry(name: string, raw: unknown, caps: string[], basePath = "/"):
 
   const path = str("path");
   if (path === undefined) {
-    throw invalidField(`${f}/path`, 'an HTTP export entry shall contain a "path" field');
+    throw invalidField(`${f}/path`,
+      'an export entry of type %j shall contain a "path" field', type);
   }
   const why = validExportPath(path);
   if (why) throw invalidField(`${f}/path`, "%s", why);
 
   const e: HttpExport = { type, origins, path };
   // The HTTP versions offered, checked against cdmi_export_http_versions.
-  if ("protocol" in obj) {
+  if (type === "MCP") {
+    // "The array shall contain at least one value, and a CDMI server shall
+    // report the invalid field condition where it is empty. A CDMI server
+    // shall report the invalid field condition where a value appears twice"
+    // [3XSW67HS]. The field is Mandatory for this type, where for an HTTP or
+    // CDMI export it is optional, so its absence is the invalid field
+    // condition and not a default.
+    //
+    // The duplicate rule is this field's own and is not in parseVersions:
+    // the same rule is stated for the SMB and NFS export types, whose
+    // entries check it themselves, and is not stated for the protocol field
+    // of an HTTP or a CDMI export, so applying it there would be this server
+    // refusing an entry the document permits.
+    if (!("protocol" in obj)) {
+      throw invalidField(`${f}/protocol`,
+        'an MCP export entry shall contain a "protocol" field naming the ' +
+        "protocol versions to offer; the field is mandatory for this type");
+    }
+    const asked = obj.protocol;
+    if (Array.isArray(asked)) {
+      for (const [i, v] of asked.entries()) {
+        if (asked.indexOf(v) !== i) {
+          throw invalidField(`${f}/protocol`, "the version %j appears twice", v);
+        }
+      }
+    }
+    e.protocol = parseVersions(`${f}/protocol`, obj.protocol,
+      "cdmi_export_mcp_versions", MCP_EXPORT_VERSIONS);
+  } else if ("protocol" in obj) {
     // The versions an entry names are those its own capability offers: an
     // HTTP export serves versions of HTTP, and a CDMI export versions of
     // this document (revision 327).
@@ -856,7 +962,9 @@ function parseEntry(name: string, raw: unknown, caps: string[], basePath = "/"):
   // capability is unavailable" (ECR-114B). This server does not publish it.
   // Before 0.61 the field was refused as an invalid field.
   if ("certificates" in obj) {
-    throw capabilityNotPresent("cdmi_export_http_certificates", `${basePath}cdmi_capabilities/`,
+    throw capabilityNotPresent(
+      type === "MCP" ? "cdmi_export_mcp_certificates" : "cdmi_export_http_certificates",
+      `${basePath}cdmi_capabilities/`,
       "this CDMI server cannot present a certificate an entry names: its private key is to be operated in place " +
       "by the key management server during the TLS handshake, which the TLS implementation this server uses " +
       "cannot do, and the key shall not be retrieved. A certificate this server holds for the origin's host is " +
@@ -875,12 +983,37 @@ function parseEntry(name: string, raw: unknown, caps: string[], basePath = "/"):
   // schemes this server can perform at all, and against the domain's own
   // list when a request arrives.
   const auth = str("auth_method");
-  if (auth !== undefined && !EXPORT_AUTH_METHODS.includes(auth)) {
+  if (type === "MCP") {
+    // "bearer, krb5, or x509 (the client certificate of the TLS handshake)"
+    // [0CFVL3CC]. The set is not the HTTP export's: an MCP export has no
+    // anonymous or basic scheme, every tool call carrying a principal
+    // [CZTLU9CT].
+    if (auth !== undefined && !MCP_AUTH_METHODS.includes(auth)) {
+      throw invalidField(`${f}/auth_method`,
+        "the authentication scheme of an MCP export is one of %s",
+        MCP_AUTH_METHODS.join(", "));
+    }
+    // "The CDMI server shall report the invalid field condition where the
+    // value is x509 and any origin has the scheme http" [0CFVL3CC]: there is
+    // no TLS handshake on such an origin, so no client certificate to
+    // associate a request with a principal by.
+    if (auth === "x509" && origins.some((o) => o.startsWith("http://"))) {
+      throw invalidField(`${f}/auth_method`,
+        'an auth_method of "x509" is the client certificate of the TLS ' +
+        "handshake, and %j has the http scheme, where there is no handshake",
+        origins.find((o) => o.startsWith("http://")));
+    }
+  } else if (auth !== undefined && !EXPORT_AUTH_METHODS.includes(auth)) {
     throw invalidField(`${f}/auth_method`,
       "the authentication scheme of an HTTP export is one of %s",
       EXPORT_AUTH_METHODS.join(", "));
   }
   e.auth_method = auth;
+  // "Indicates if the MCP export implements the MCP bindings ... The default
+  // value shall be false" [ATL2MV7L]. The default is not written into the
+  // entry: an absent field reads as "false" where it is consulted, as every
+  // other field of this shape does.
+  if (type === "MCP") e.binding = bool("binding");
 
   const index = str("index_document");
   if (index !== undefined && (index.includes("/") || index === "." || index === "..")) {
@@ -1305,10 +1438,17 @@ const TITLES: Record<string, string> = {
   "error-document-absent": "The error document is absent.",
 };
 
-function exportProblem(cond: string, name: string, origin: string, detail: string): Problem {
+/**
+ * A problem of an export entry. `kind` is the export type's segment of the
+ * problem type, which is the type whose subclause defines the condition:
+ * a problem of an MCP export is not one of "exports/http", and reporting it
+ * under that name would tell a CDMI client to look in the wrong subclause.
+ */
+function exportProblem(cond: string, name: string, origin: string, detail: string,
+  kind = "http"): Problem {
   const members: Record<string, unknown> = { cdmi_export: name };
   if (origin !== "") members.cdmi_origin = origin;
-  return problem(`exports/http/${cond}`, TITLES[cond] ?? cond, detail, members);
+  return problem(`exports/${kind}/${cond}`, TITLES[cond] ?? cond, detail, members);
 }
 
 /** Resolves dot segments, RFC 3986 section 5.2.4, on the encoded path. */
@@ -1545,6 +1685,14 @@ function nodeAtPath(store: Store, ns: string): Node | undefined {
  * that named one would promise what it cannot do.
  */
 export const EXPORT_AUTH_METHODS = ["anonymous", "basic", "bearer", "krb5"];
+
+/**
+ * The authentication schemes of an MCP export [0CFVL3CC]. It is not the HTTP
+ * export's set: an MCP export mediates each operation and every tool call
+ * carries a principal, so it has no anonymous scheme, and the subclause names
+ * x509 where an HTTP export does not.
+ */
+export const MCP_AUTH_METHODS = ["bearer", "krb5", "x509"];
 
 export interface ExportOptions {
   /** The port at which requests of the https scheme are accepted. */
@@ -2089,6 +2237,46 @@ export class Exports {
   }
 
   /**
+   * The certificate_expiry field of an MCP export entry: for each "https"
+   * origin actually served, when the certificate presented for it stops
+   * being valid [850F5C9F].
+   *
+   * Where this server cannot establish an expiry — it presents a certificate
+   * it was configured with, and a deployment may be serving plain HTTP — no
+   * element is reported for that origin rather than a guessed time. The field
+   * is Mandatory, so it is present and may be empty; what it must not do is
+   * state a time this server has not obtained.
+   */
+  private certificateExpiry(e: HttpExport, served: string[]):
+    { origin: string; expires: string }[] {
+    const out: { origin: string; expires: string }[] = [];
+    for (const origin of served) {
+      if (!origin.startsWith("https://")) continue;
+      const expires = this.certificateExpiresAt(e, origin);
+      if (expires !== undefined) out.push({ origin, expires });
+    }
+    return out;
+  }
+
+  /**
+   * When the certificate presented at an origin stops being valid, where this
+   * server can read it from the certificate it holds.
+   */
+  private certificateExpiresAt(e: HttpExport, origin: string): string | undefined {
+    const held = this.certificateFor(e, origin);
+    if (held === undefined) return undefined;
+    try {
+      const at = Date.parse(new X509Certificate(held.chain).validTo);
+      return Number.isNaN(at) ? undefined : cdmiTime(at);
+    } catch {
+      // A certificate this server cannot parse states no expiry it can
+      // report, and reporting none is what the field requires of a value it
+      // has not obtained.
+      return undefined;
+    }
+  }
+
+  /**
    * Whether an active HTTP export would transfer the value of the object
    * at ns. An export transfers the values of the objects within the
    * container object it is placed on.
@@ -2333,6 +2521,32 @@ export class Exports {
           origins_provided: served,
           active: served.length > 0 ? "true" : "false",
           last_problems: [...problems, ...unservableProblems(e)],
+          state_determined_time: now,
+        };
+        continue;
+      }
+      // An MCP export reports the fields its own table defines. The HTTP
+      // export's documents, max_age, read_only and anonymous_read are not
+      // among them, and two fields are populated: origins_provided
+      // [1NJOL90N] and certificate_expiry [850F5C9F], the latter reporting
+      // an element for each https origin actually served.
+      if (e.type === "MCP") {
+        out[name] = {
+          type: e.type,
+          protocol: e.protocol ?? [],
+          origins: e.origins,
+          path: e.path,
+          ...(e.auth_method !== undefined ? { auth_method: e.auth_method } : {}),
+          binding: e.binding ?? "false",
+          disabled: e.disabled ?? "false",
+          // Nothing is served, so no origin is provided and the entry is not
+          // active. Reporting the origins as provided would say an endpoint
+          // answers at each of them.
+          origins_provided: [],
+          certificate_expiry: this.certificateExpiry(e, []),
+          active: "false",
+          last_problems: [...problems, ...unservableProblems(e),
+            ...mcpNotServed(name, served)],
           state_determined_time: now,
         };
         continue;

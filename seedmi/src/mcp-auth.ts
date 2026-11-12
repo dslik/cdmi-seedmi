@@ -61,6 +61,29 @@ export class Unauthenticated extends Error {
   }
 }
 
+/**
+ * What a CDMI server can say about a token before any message is read.
+ *
+ * "refused" and "unavailable" are kept apart because they send a reader to
+ * different places: the first is a fact about the token, the second is a fact
+ * about this server's reach. Until this existed the second was reported as the
+ * first, so a deployment whose controller was unreachable was told its tokens
+ * were issued for somebody else.
+ */
+export type TokenVerdict = "accepted" | "refused" | { readonly unavailable: string };
+
+/**
+ * Raised where no authorization server that might have accepted the token
+ * could be reached. The token is not at fault and has not been examined; the
+ * CDMI binding answers 503 authentication-unavailable in the same case.
+ */
+export class AuthenticationUnavailable extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AuthenticationUnavailable";
+  }
+}
+
 /** Raised where a token is accepted but does not carry the scope the call requires. */
 export class InsufficientScope extends Error {
   readonly challenge: string;
@@ -103,7 +126,7 @@ export interface ResourceServerOptions {
    * tool list, the initialization — names no domain to resolve a subject
    * within, and its token was not checked at all before 0.83.
    */
-  accepts: (token: string) => Promise<boolean>;
+  accepts: (token: string) => Promise<TokenVerdict>;
 }
 
 export class ResourceServer {
@@ -179,7 +202,21 @@ export class ResourceServer {
    * this server accepts issued the token, for this server.
    */
   async accept(token: string): Promise<void> {
-    if (await this.opts.accepts(token)) return;
+    const verdict = await this.opts.accepts(token);
+    if (verdict === "accepted") return;
+    if (typeof verdict === "object") {
+      // Not a 401: nothing has refused this token. Saying "invalid_token"
+      // here would be a claim about a credential that was never examined, and
+      // a client that believes it goes and obtains another identical one.
+      // The reason travels: "the controller cannot be reached" and "the
+      // controller presented a certificate other than the one ca_file names"
+      // call for different actions, the second being a possible impersonation
+      // of the authorization server, and an operator reading a generic 503
+      // cannot tell them apart.
+      throw new AuthenticationUnavailable(
+        "no authorization server this CDMI server accepts could be reached, so the access " +
+        "token could not be evaluated; the token is not at fault. " + verdict.unavailable);
+    }
     throw new Unauthenticated(
       this.challenge("invalid_token",
         "the access token was not issued for this CDMI server by an authorization " +
